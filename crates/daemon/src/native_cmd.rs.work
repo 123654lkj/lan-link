@@ -1,0 +1,467 @@
+//! Native command implementations
+//!
+//! Each command is executed on the daemon using controlled std::process::Command.
+//! No shell wrappers (sh -c). Truly native commands read /proc directly.
+//! Results returned as (output_bytes, exit_code).
+
+use lan_link_protocol::frame::NativeCmdType;
+use std::io::Write;
+use std::net::TcpStream;
+use std::process::{Command, Stdio};
+
+fn sys_exec(cmd: &str, args: &[&str]) -> (Vec<u8>, Option<i32>) {
+    let output = match Command::new(cmd).args(args).stdout(Stdio::piped()).stderr(Stdio::piped()).output() {
+        Ok(o) => o,
+        Err(e) => return (format!("error: {}\n", e).into_bytes(), Some(1)),
+    };
+    let mut out = output.stdout;
+    if !output.stderr.is_empty() {
+        if !out.is_empty() { out.extend_from_slice(b"\n"); }
+        out.extend_from_slice(&output.stderr);
+    }
+    (out, output.status.code())
+}
+
+fn read_proc(path: &str) -> String {
+    std::fs::read_to_string(path).unwrap_or_default()
+}
+
+// ─── Truly native commands (Linux /proc) ─────────────────────────
+
+fn cmd_uptime() -> (Vec<u8>, Option<i32>) {
+    let s = read_proc("/proc/uptime");
+    let secs: f64 = s.split_whitespace().next().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+    let d = (secs / 86400.0) as u64;
+    let h = ((secs % 86400.0) / 3600.0) as u64;
+    let m = ((secs % 3600.0) / 60.0) as u64;
+    (format!("up {} days, {:02}:{:02}\n", d, h, m).into_bytes(), Some(0))
+}
+
+fn cmd_hostname() -> (Vec<u8>, Option<i32>) {
+    (read_proc("/proc/sys/kernel/hostname").into_bytes(), Some(0))
+}
+
+fn cmd_free(human: bool) -> (Vec<u8>, Option<i32>) {
+    let mem = read_proc("/proc/meminfo");
+    let kv = |k: &str| -> u64 {
+        mem.lines().find(|l| l.starts_with(k))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|v| v.parse().ok()).unwrap_or(0)
+    };
+    let mt = kv("MemTotal:"); let mf = kv("MemFree:"); let ma = kv("MemAvailable:");
+    let mu = mt.saturating_sub(ma);
+    let st = kv("SwapTotal:"); let sf = kv("SwapFree:"); let su = st.saturating_sub(sf);
+    let mut out = String::from("              Mem:\n");
+    if human {
+        out += &format!("{:>8} {:>8} {:>8} {:>8}\n", "total", "used", "free", "avail");
+        out += &format!("{:>8} {:>8} {:>8} {:>8}\n", hfmt(mt), hfmt(mu), hfmt(mf), hfmt(ma));
+        out += &format!("              Swap: {:>8} {:>8} {:>8}\n", hfmt(st), hfmt(su), hfmt(sf));
+    } else {
+        out += &format!("{:>12} {:>12} {:>12} {:>12}\n", "total", "used", "free", "avail");
+        out += &format!("{:>12} {:>12} {:>12} {:>12}\n", mt, mu, mf, ma);
+        out += &format!("              Swap: {:>12} {:>12} {:>12}\n", st, su, sf);
+    }
+    (out.into_bytes(), Some(0))
+}
+
+fn hfmt(s: u64) -> String {
+    if s < 1024 { return format!("{}B", s); }
+    let kb = s / 1024;
+    if kb < 1024 { return format!("{}K", kb); }
+    let mb = kb / 1024;
+    if mb < 1024 { return format!("{}.{}M", mb, (kb % 1024) * 10 / 1024); }
+    format!("{}.{}G", mb / 1024, (mb % 1024) * 10 / 1024)
+}
+
+fn cmd_cpu() -> (Vec<u8>, Option<i32>) {
+    let info = read_proc("/proc/cpuinfo");
+    let mut out = String::new();
+    for line in info.lines() {
+        if line.starts_with("processor") || line.starts_with("model name")
+            || line.starts_with("cpu MHz") || line.starts_with("cache size")
+        {
+            out += line; out += "\n";
+        }
+    }
+    (out.into_bytes(), Some(0))
+}
+
+fn cmd_uname(all: bool, release: bool, machine: bool) -> (Vec<u8>, Option<i32>) {
+    if all {
+        let p = [
+            read_proc("/proc/sys/kernel/ostype").trim().to_string(),
+            read_proc("/proc/sys/kernel/hostname").trim().to_string(),
+            read_proc("/proc/sys/kernel/osrelease").trim().to_string(),
+            read_proc("/proc/sys/kernel/version").trim().to_string(),
+            read_proc("/proc/sys/kernel/arch").trim().to_string(),
+        ];
+        return (format!("{} {} {} {} {}\n", p[0], p[1], p[2], p[3], p[4]).into_bytes(), Some(0));
+    }
+    if release { return (read_proc("/proc/sys/kernel/osrelease").into_bytes(), Some(0)); }
+    if machine { return (read_proc("/proc/sys/kernel/arch").into_bytes(), Some(0)); }
+    (read_proc("/proc/sys/kernel/ostype").into_bytes(), Some(0))
+}
+
+fn cmd_whoami() -> (Vec<u8>, Option<i32>) {
+    let e = std::env::var("USER").or_else(|_| std::env::var("LOGNAME")).unwrap_or_default();
+    if !e.is_empty() { return (format!("{}\n", e).into_bytes(), Some(0)); }
+    sys_exec("id", &["-un"])
+}
+
+fn cmd_ps(full: bool, user: Option<String>, tree: bool) -> (Vec<u8>, Option<i32>) {
+    if tree { return sys_exec("ps", &["auxf"]); }
+    let dir = match std::fs::read_dir("/proc") { Ok(d) => d, Err(_) => return sys_exec("ps", &["aux"]) };
+    let h = if full { "USER       PID %CPU %MEM    VSZ    RSS TTY      STAT   START   TIME COMMAND\n" }
+             else { "  PID TTY          TIME CMD\n" };
+    let mut out = String::from(h);
+    for e in dir.filter_map(|e| e.ok()) {
+        let pid: u32 = match e.file_name().to_string_lossy().parse() { Ok(p) => p, _ => continue };
+        let status = read_proc(&format!("/proc/{}/status", pid));
+        let cl = read_proc(&format!("/proc/{}/cmdline", pid));
+        let st = status.lines().find(|l| l.starts_with("State:")).and_then(|l| l.split_whitespace().nth(1)).unwrap_or("?");
+        let pn = status.lines().find(|l| l.starts_with("Name:")).and_then(|l| l.split('\t').nth(1)).unwrap_or("").trim();
+        let cmd = if cl.is_empty() { format!("[{}]", pn) } else { cl.replace('\0', " ") };
+        if !full {
+            out += &format!("{:>5} {:<8} {} {}\n", pid, "?", "00:00:00", cmd.trim());
+        } else {
+            let stat = read_proc(&format!("/proc/{}/stat", pid));
+            let f: Vec<&str> = stat.split_whitespace().collect();
+            if let Some(ref u) = user { if pn != u.as_str() { continue; } }
+            out += &format!("{:<8} {:>5} {:>5} {:>5} {:>7} {:>7} {:<8} {:<9} {:<10} {}\n",
+                "?", pid, "0.0", "0.0", f.get(22).unwrap_or(&"0"), f.get(23).unwrap_or(&"0"), "?", st, "00:00:00", cmd.trim());
+        }
+    }
+    (out.into_bytes(), Some(0))
+}
+
+fn cmd_info() -> (Vec<u8>, Option<i32>) {
+    let mut out = String::new();
+    let (u, _) = cmd_uname(true, false, false); out += &String::from_utf8_lossy(&u); out += "---\n";
+    let cpu = read_proc("/proc/cpuinfo");
+    if let Some(l) = cpu.lines().find(|l| l.starts_with("model name")) { out += l; out += "\n"; }
+    out += "---\n";
+    let (f, _) = cmd_free(true); out += &String::from_utf8_lossy(&f); out += "---\n";
+    let (uf, _) = cmd_uptime(); out += &String::from_utf8_lossy(&uf);
+    (out.into_bytes(), Some(0))
+}
+
+fn cmd_ls(path: &str, long: bool, all: bool) -> (Vec<u8>, Option<i32>) {
+    let dir = match std::fs::read_dir(path) { Ok(d) => d, Err(e) => return (format!("ls: {}: {}\n", path, e).into_bytes(), Some(2)) };
+    let mut entries: Vec<_> = dir.filter_map(|e| e.ok()).collect();
+    entries.sort_by_key(|e| e.file_name());
+    let mut out = Vec::new();
+    for e in &entries {
+        let name = e.file_name().to_string_lossy().to_string();
+        if !all && name.starts_with('.') { continue; }
+        if long {
+            #[cfg(target_os = "linux")]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if let Ok(m) = e.metadata() {
+                    let ft = if m.is_dir() { 'd' } else if m.is_symlink() { 'l' } else { '-' };
+                    let _ = writeln!(out, "{}{:04o} {:>3} {:>8} {:>8} {:>8} {} {}", ft, m.mode() & 0o7777, m.nlink(), m.uid(), m.gid(), m.size(), "", name);
+                } else {
+                    let _ = writeln!(out, "{}", name);
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            { let _ = writeln!(out, "{}", name); }
+        } else {
+            let _ = writeln!(out, "{}", name);
+        }
+    }
+    (out, Some(0))
+}
+
+fn cmd_cat(path: &str) -> (Vec<u8>, Option<i32>) {
+    match std::fs::read(path) { Ok(d) => (d, Some(0)), Err(e) => (format!("cat: {}: {}\n", path, e).into_bytes(), Some(1)) }
+}
+
+fn cmd_head(path: &str, lines: u32) -> (Vec<u8>, Option<i32>) {
+    let c = match std::fs::read_to_string(path) { Ok(c) => c, Err(e) => return (format!("head: {}: {}\n", path, e).into_bytes(), Some(1)) };
+    (c.lines().take(lines as usize).flat_map(|l| [l, "\n"]).collect::<String>().into_bytes(), Some(0))
+}
+
+fn cmd_tail(path: &str, n: u32) -> (Vec<u8>, Option<i32>) {
+    let c = match std::fs::read_to_string(path) { Ok(c) => c, Err(e) => return (format!("tail: {}: {}\n", path, e).into_bytes(), Some(1)) };
+    let l: Vec<&str> = c.lines().collect();
+    let start = if (n as usize) >= l.len() { 0 } else { l.len() - n as usize };
+    (l[start..].iter().flat_map(|l| [*l, "\n"]).collect::<String>().into_bytes(), Some(0))
+}
+
+fn cmd_stat(path: &str) -> (Vec<u8>, Option<i32>) {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let Ok(m) = std::fs::metadata(path) {
+            let mut out = format!("  File: {}\n", path);
+            out += &format!("  Size: {}    Blocks: {}    IO Block: {}\n", m.len(), m.blocks(), m.blksize());
+            out += &format!("Device: {}/{}    Inode: {}    Links: {}\n", m.dev(), m.rdev(), m.ino(), m.nlink());
+            out += &format!("Access: ({:04o}/{:?})  Uid: {}  Gid: {}\n", m.mode() & 0o7777, m.permissions(), m.uid(), m.gid());
+            return (out.into_bytes(), Some(0));
+        }
+    }
+    (format!("  File: {}\n  (metadata unavailable on this platform)\n", path).into_bytes(), Some(1))
+}
+
+fn cmd_grep(pattern: &str, path: &str, recursive: bool, ln: bool, cnt: bool) -> (Vec<u8>, Option<i32>) {
+    if !recursive {
+        let c = match std::fs::read_to_string(path) { Ok(c) => c, Err(e) => return (format!("grep: {}: {}\n", path, e).into_bytes(), Some(2)) };
+        let mut out = String::new(); let mut m = 0usize;
+        for (i, l) in c.lines().enumerate() {
+            if l.contains(pattern) { m += 1; if !cnt { out += &if ln { format!("{}:{}:{}\n", path, i+1, l) } else { format!("{}\n", l) }; } }
+        }
+        return (if cnt { format!("{}:{}\n", path, m).into_bytes() } else { out.into_bytes() }, Some(if m > 0 { 0 } else { 1 }));
+    }
+    let mut out = String::new(); let mut total = 0usize;
+    grep_walk(std::path::Path::new(path), pattern, &mut out, &mut total, ln, cnt);
+    (if cnt { format!("{}\n", total).into_bytes() } else { out.into_bytes() }, Some(if total > 0 { 0 } else { 1 }))
+}
+
+fn grep_walk(p: &std::path::Path, pat: &str, out: &mut String, t: &mut usize, ln: bool, cnt: bool) {
+    if let Ok(entries) = std::fs::read_dir(p) {
+        for entry in entries.filter_map(|e| e.ok()) {
+            if entry.path().is_dir() {
+                grep_walk(&entry.path(), pat, out, t, ln, cnt);
+            } else if let Ok(c) = std::fs::read_to_string(&entry.path()) {
+                let mut fm = 0usize;
+                for (i, l) in c.lines().enumerate() {
+                    if l.contains(pat) { fm += 1; if !cnt { let _line = if ln { format!("{}:{}:{}\n", entry.path().display(), i+1, l) } else { format!("{}:{}\n", entry.path().display(), l) }; out.push_str(&_line); } }
+                }
+                *t += fm;
+            }
+        }
+    }
+}
+
+fn cmd_arp() -> (Vec<u8>, Option<i32>) {
+    (read_proc("/proc/net/arp").into_bytes(), Some(0))
+}
+
+fn cmd_netstat(tcp: bool, udp: bool, listening: bool) -> (Vec<u8>, Option<i32>) {
+    let mut out = String::new();
+    if tcp || (!tcp && !udp) {
+        out += "Proto Recv-Q Send-Q Local Address           Foreign Address         State\n";
+        for line in read_proc("/proc/net/tcp").lines().skip(1) {
+            let p: Vec<&str> = line.split_whitespace().collect(); if p.len() < 4 { continue; }
+            let s = match u8::from_str_radix(p[3], 16).unwrap_or(0) { 10 => "LISTEN", 1 => "ESTABLISHED", _ => "OTHER" };
+            if listening && s != "LISTEN" { continue; }
+            out += &format!("tcp    0      0 {:<22} {:<22} {}\n", hex2addr(p[1]), hex2addr(p[2]), s);
+        }
+    }
+    if udp {
+        out += "\nProto Recv-Q Send-Q Local Address           Foreign Address         State\n";
+        for line in read_proc("/proc/net/udp").lines().skip(1) {
+            let p: Vec<&str> = line.split_whitespace().collect(); if p.len() < 4 { continue; }
+            out += &format!("udp    0      0 {:<22} {:<22} {}\n", hex2addr(p[1]), hex2addr(p[2]), "ESTABLISHED");
+        }
+    }
+    (out.into_bytes(), Some(0))
+}
+
+fn hex2addr(s: &str) -> String {
+    let p: Vec<&str> = s.split(':').collect();
+    if p.len() < 2 { return s.to_string(); }
+    let port = u16::from_str_radix(p[1], 16).unwrap_or(0);
+    if p[0].len() == 8 {
+        let b: Vec<u8> = (0..4).map(|i| u8::from_str_radix(&p[0][i*2..i*2+2], 16).unwrap_or(0)).collect();
+        format!("{}.{}.{}.{}:{}", b[3], b[2], b[1], b[0], port)
+    } else { format!("[{}]:{}", p[0], port) }
+}
+
+fn cmd_top_snapshot() -> String {
+    let mut out = String::from("top - native\n\n");
+    let load = read_proc("/proc/loadavg");
+    out += &format!("load average: {}\n\n", load.split_whitespace().take(3).collect::<Vec<_>>().join(" "));
+    let mut total = 0u32; let mut running = 0u32;
+    if let Ok(dir) = std::fs::read_dir("/proc") {
+        for e in dir.filter_map(|e| e.ok()) {
+            if e.file_name().to_string_lossy().parse::<u32>().is_ok() {
+                total += 1;
+                let s = read_proc(&format!("/proc/{}/status", e.file_name().to_string_lossy()));
+                if s.lines().find(|l| l.starts_with("State:")).map(|l| l.contains("running")).unwrap_or(false) { running += 1; }
+            }
+        }
+    }
+    out += &format!("Tasks: {} total, {} running\n", total, running);
+    let mem = read_proc("/proc/meminfo");
+    let kv = |k: &str| -> u64 { mem.lines().find(|l| l.starts_with(k)).and_then(|l| l.split_whitespace().nth(1)).and_then(|v| v.parse().ok()).unwrap_or(0) };
+    let mt = kv("MemTotal:") / 1024; let mf = kv("MemFree:") / 1024; let ma = kv("MemAvailable:") / 1024;
+    let mu = mt.saturating_sub(ma);
+    out += &format!("MiB Mem: {:>8.1} total, {:>8.1} free, {:>8.1} used, {:>8.1} avail\n", mt as f64/1024.0, mf as f64/1024.0, mu as f64/1024.0, ma as f64/1024.0);
+    out += "\n  PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND\n";
+    let mut ps = Vec::new();
+    if let Ok(dir) = std::fs::read_dir("/proc") {
+        for e in dir.filter_map(|e| e.ok()) {
+            let pid: u32 = match e.file_name().to_string_lossy().parse() { Ok(p) => p, _ => continue };
+            let stat = read_proc(&format!("/proc/{}/stat", pid));
+            let f: Vec<&str> = stat.split_whitespace().collect();
+            if f.len() < 24 { continue; }
+            let ut: u64 = f[13].parse().unwrap_or(0); let st: u64 = f[14].parse().unwrap_or(0);
+            let vsz: u64 = f[22].parse().unwrap_or(0); let rss: u64 = f[23].parse().unwrap_or(0);
+            ps.push((pid, (ut + st) as f64, vsz, rss * 4));
+        }
+    }
+    ps.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    for (pid, _, vsz, rss) in ps.iter().take(20) {
+        let cl = read_proc(&format!("/proc/{}/cmdline", pid));
+        let cmd = if cl.is_empty() { format!("[{}]", pid) } else { cl.replace('\0', " ").split_whitespace().next().unwrap_or("?").to_string() };
+        out += &format!("{:>5} ?        20   0 {:>7} {:>7} ?    S   0.0  0.0   0:00.00 {}\n", pid, vsz/1024, rss/1024, cmd);
+    }
+    out
+}
+
+fn cmd_portscan(host: &str, start: u16, end: u16) -> (Vec<u8>, Option<i32>) {
+    let mut out = format!("Scanning ports {}-{} on {}\n", start, end, host);
+    for port in start..=end {
+        if let Ok(addr) = format!("{}:{}", host, port).parse::<std::net::SocketAddr>() {
+            if TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(200)).is_ok() {
+                out += &format!("Port {} is open\n", port);
+            }
+        }
+    }
+    (out.into_bytes(), Some(0))
+}
+
+// ─── Main dispatch ──────────────────────────────────────────────
+
+pub fn run_native_cmd(cmd: &NativeCmdType) -> (Vec<u8>, Option<i32>) {
+    match cmd {
+        NativeCmdType::Ls { path, long, all } => cmd_ls(path, *long, *all),
+        NativeCmdType::Cat { path } => cmd_cat(path),
+        NativeCmdType::Head { path, lines } => cmd_head(path, *lines),
+        NativeCmdType::Tail { path, lines, .. } => cmd_tail(path, *lines),
+        NativeCmdType::Stat { path } => cmd_stat(path),
+        NativeCmdType::Uptime => cmd_uptime(),
+        NativeCmdType::Hostname => cmd_hostname(),
+        NativeCmdType::Free { human } => cmd_free(*human),
+        NativeCmdType::Cpu => cmd_cpu(),
+        NativeCmdType::Uname { all, release, machine } => cmd_uname(*all, *release, *machine),
+        NativeCmdType::Whoami => cmd_whoami(),
+        NativeCmdType::Ps { full, user, tree } => cmd_ps(*full, user.clone(), *tree),
+        NativeCmdType::Info => cmd_info(),
+        NativeCmdType::Arp => cmd_arp(),
+        NativeCmdType::Netstat { tcp, udp, listening, .. } => cmd_netstat(*tcp, *udp, *listening),
+        NativeCmdType::PortScan { host, start_port, end_port, .. } => cmd_portscan(host, *start_port, *end_port),
+        NativeCmdType::Top { .. } => (cmd_top_snapshot().into_bytes(), Some(0)),
+        NativeCmdType::Grep { pattern, path, recursive, line_number, count } => cmd_grep(pattern, path, *recursive, *line_number, *count),
+
+        // ── Controlled sys_exec (structured args, no shell) ──
+        NativeCmdType::Dmesg { .. } => sys_exec("dmesg", &[]),
+        NativeCmdType::Lsblk => sys_exec("lsblk", &[]),
+        NativeCmdType::Mount => cmd_mount(),
+        NativeCmdType::Who => cmd_who(),
+        NativeCmdType::Kill { pid, signal } => cmd_kill(*pid, *signal),
+                NativeCmdType::Pgrep { name, full, count } => cmd_pgrep(name, *full, *count),
+
+        NativeCmdType::Dns { hostname, .. } => cmd_dns(hostname),
+        NativeCmdType::Ssh => cmd_ssh_check(),
+                NativeCmdType::Mkdir { recursive, paths } => cmd_mkdir(*recursive, paths),
+
+                NativeCmdType::Rm { recursive, force, paths } => cmd_rm(*recursive, *force, paths),
+
+        NativeCmdType::Mv { src, dest } => cmd_mv(src, dest),
+                NativeCmdType::Cp { recursive, src, dest } => cmd_cp(*recursive, src, dest),
+                NativeCmdType::Chmod { mode, paths } => cmd_chmod(mode, paths),
+
+                NativeCmdType::Chown { owner, paths } => cmd_chown(owner, paths),
+
+        NativeCmdType::Diff { file1, file2 } => cmd_diff(file1, file2),
+                NativeCmdType::Wc { lines, words, paths } => cmd_wc(*lines, *words, paths),
+
+                        NativeCmdType::Find { path, name, type_, maxdepth } => cmd_find(path, name.as_deref(), type_.as_deref(), *maxdepth),
+
+                NativeCmdType::Tree { path, depth, dirs_only } => cmd_tree(path, *depth, *dirs_only),
+
+                NativeCmdType::Du { path, summarize, maxdepth } => cmd_du(path, *summarize, *maxdepth),
+
+        NativeCmdType::Df { human, .. } => cmd_df(*human),
+        NativeCmdType::Last { lines } => cmd_last(*lines),
+        NativeCmdType::Ip { .. } => sys_exec("ip", &["addr"]),
+        // ── Management ──
+        NativeCmdType::Service { action } => {
+            use lan_link_protocol::frame::ServiceActionType;
+            match action {
+                ServiceActionType::List { active, failed } => {
+                    if *failed { sys_exec("systemctl", &["--failed"]) }
+                    else if *active { sys_exec("systemctl", &["list-units", "--type=service", "--state=running"]) }
+                    else { sys_exec("systemctl", &["list-units", "--type=service"]) }
+                }
+                ServiceActionType::Status { name } => sys_exec("systemctl", &["status", name]),
+                ServiceActionType::Start { name } => sys_exec("systemctl", &["start", name]),
+                ServiceActionType::Stop { name } => sys_exec("systemctl", &["stop", name]),
+                ServiceActionType::Restart { name } => sys_exec("systemctl", &["restart", name]),
+                ServiceActionType::Reload { name } => sys_exec("systemctl", &["reload", name]),
+                ServiceActionType::Enable { name } => sys_exec("systemctl", &["enable", name]),
+                ServiceActionType::Disable { name } => sys_exec("systemctl", &["disable", name]),
+            }
+        }
+        NativeCmdType::Journal { unit, lines, priority, since, follow } => {
+            let n_str = lines.to_string();
+            let mut a = vec!["-n", n_str.as_str()];
+            if let Some(u) = unit { a.push("-u"); a.push(u.as_str()); }
+            if *follow { a.push("-f"); }
+            if let Some(p) = priority { a.push("-p"); a.push(p.as_str()); }
+            if let Some(s) = since { a.push("--since"); a.push(s.as_str()); }
+            sys_exec("journalctl", &a)
+        }
+        NativeCmdType::Pkg { action } => {
+            use lan_link_protocol::frame::PkgActionType;
+            match action {
+                PkgActionType::List { .. } => sys_exec("dpkg", &["--list"]),
+                PkgActionType::Search { query } => sys_exec("apt-cache", &["search", query]),
+                PkgActionType::Install { name } => sys_exec("apt-get", &["install", "-y", name]),
+                PkgActionType::Remove { name } => sys_exec("apt-get", &["remove", "-y", name]),
+                PkgActionType::Update => sys_exec("apt-get", &["update"]),
+                PkgActionType::Upgrade => sys_exec("apt-get", &["upgrade", "-y"]),
+            }
+        }
+        NativeCmdType::Docker { action } => {
+            use lan_link_protocol::frame::DockerActionType;
+            match action {
+                DockerActionType::Ps { all, .. } => sys_exec("docker", if *all { &["ps", "-a"] } else { &["ps"] }),
+                DockerActionType::Logs { name, tail, follow } => {
+                    let tail_str = format!("--tail={}", tail);
+                    let mut a = vec!["logs", tail_str.as_str(), name.as_str()];
+                    if *follow { a.push("-f"); }
+                    sys_exec("docker", &a)
+                }
+                DockerActionType::Stats { .. } => sys_exec("docker", &["stats", "--no-stream"]),
+                DockerActionType::Exec { container, cmd } => {
+                    let mut a = vec!["exec", container.as_str()];
+                    a.extend(cmd.iter().map(|s| s.as_str())); sys_exec("docker", &a)
+                }
+                DockerActionType::Info => sys_exec("docker", &["info"]),
+                DockerActionType::Images => sys_exec("docker", &["images"]),
+                DockerActionType::Rm { container, force } => {
+                    if *force { sys_exec("docker", &["rm", "-f", container]) }
+                    else { sys_exec("docker", &["rm", container]) }
+                }
+                DockerActionType::Control { container, action } => sys_exec("docker", &[action.as_str(), container.as_str()]),
+            }
+        }
+        NativeCmdType::Crontab { action } => {
+            use lan_link_protocol::frame::CrontabActionType;
+            match action {
+                CrontabActionType::List => sys_exec("crontab", &["-l"]),
+                CrontabActionType::Edit => (b"Use iexec crontab -e for editing\n".to_vec(), Some(0)),
+                CrontabActionType::Remove => sys_exec("crontab", &["-r"]),
+            }
+        }
+        NativeCmdType::Firewall { backend } => {
+            match backend.as_str() {
+                "ufw" => sys_exec("ufw", &["status", "verbose"]),
+                "firewalld" => sys_exec("firewall-cmd", &["--list-all"]),
+                _ => sys_exec("iptables", &["-L", "-n", "-v"]),
+            }
+        }
+        NativeCmdType::Checksum { path, algorithm } => {
+            match algorithm.as_str() {
+                "md5" | "md5sum" => sys_exec("md5sum", &[path]),
+                _ => sys_exec("sha256sum", &[path]),
+            }
+        }
+        NativeCmdType::BatchContent { lines, .. } => (lines.join("\n").into_bytes(), Some(0)),
+        NativeCmdType::Watch { cmd, .. } => (cmd.join(" ").into_bytes(), Some(0)),
+    }
+}

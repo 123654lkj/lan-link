@@ -1,0 +1,1 @@
+{"content":"Max 套餐用户(M3/MiniMax Code Plan)实际走 5h 请求次数窗口而非 token 积分, cache 命中不直接减少 5h 配额。cache 优惠主要体现在: 1) 按 token 计费用户账单减少; 2) 响应延迟降低(无需重编码 prompt)。要突破 5h 窗口只能升级 Ultra 或等待窗口重置。(2026-06-01 自我澄清)","importance":0.6,"category":"lesson","tags":["minimax","token-plan","cache","quota","5h-window"]}

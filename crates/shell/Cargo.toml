@@ -1,0 +1,10 @@
+[package]
+name = "lan-link-shell"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+lan-link-protocol = { path = "../protocol" }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+anyhow = "1"

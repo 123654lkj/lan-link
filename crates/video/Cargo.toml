@@ -1,0 +1,9 @@
+[package]
+name = "lan-link-video"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+lan-link-protocol = { path = "../protocol" }
+tracing = "0.1"
+anyhow = "1"

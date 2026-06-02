@@ -1,0 +1,19 @@
+﻿[package]
+name = "lan-linkctl"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "lan-linkctl"
+path = "src/main.rs"
+
+[dependencies]
+lan-link-protocol = { path = "../protocol" }
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+anyhow = "1"
+hex = "0.4"
+rand = "0.8"
+bincode = "1"

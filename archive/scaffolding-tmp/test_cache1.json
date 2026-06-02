@@ -1,0 +1,1 @@
+{"model":"MiniMax-M3","max_tokens":50,"system":[{"type":"text","text":"You are a helpful assistant. Always respond in Chinese."}],"messages":[{"role":"user","content":"1+1=?"}]}
