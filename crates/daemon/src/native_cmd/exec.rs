@@ -1,6 +1,6 @@
 // exec module
 
-pub fn cmd_watch_fn(_interval_secs: u64, cmds: &[String]) -> (Vec<u8>, Option<i32>) {
+pub fn cmd_watch_fn(cmds: &[String]) -> (Vec<u8>, Option<i32>) {
     let joined = cmds.join(" ");
     match std::process::Command::new("/bin/sh")
         .arg("-c")

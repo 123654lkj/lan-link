@@ -85,7 +85,7 @@ pub fn run_native_cmd(cmd: &NativeCmdType) -> (Vec<u8>, Option<i32>) {
 
         // -- Exec / Inline --
         NativeCmdType::BatchContent { lines, .. } => exec::cmd_batch_content(lines),
-        NativeCmdType::Watch { interval_secs, cmd } => exec::cmd_watch_fn(*interval_secs, cmd),
+        NativeCmdType::Watch { cmd, .. } => exec::cmd_watch_fn(cmd),
         NativeCmdType::Sed { path, pattern, replacement, .. } => exec::cmd_sed(path, pattern, replacement),
         NativeCmdType::Pkill { name, signal } => exec::cmd_pkill(name, *signal),
         NativeCmdType::ShellExec { cmd, .. } => exec::cmd_shell_exec(cmd),
