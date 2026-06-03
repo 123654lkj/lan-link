@@ -17,8 +17,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Windows 支持文档说明，标注当前仅支持 Linux，Windows 为未来计划
 - 清理 lib.rs 测试骨架，替换为模块级 doc comment
 
+### Security
+
+- 移除硬编码示例 PSK，GUI 连接时引导用户自动生成随机密钥
+- 应用层速率限制：SYN 限速 5/60s/IP、命令限速 30/60s/IP、连接数上限 100
+- ShellExec/Exec RCE 安全警告文档，明确标注「绝不可暴露到公网」
+
 ### Fixed
 
+- 修复 `reliable.rs` ACK 绕回逻辑：删除误标记分支，超出位图范围的 seq 保持 pending 等待重传
+- 修复 daemon 连接无状态校验：Data/Heartbeat 检查 `ConnState::Established`，不同 peer 的 SYN 拒绝覆盖
+- 修复 ctl 交互 shell stdin 丢换行符（`read_stdin_line` 发送时保留 `\n`）
+- 修复 ctl `push` 命令 ACK 超时不重发（新增 3 次递增间隔重试）
+- 修复 daemon `tail` 的 `follow_secs` 参数被忽略（用 `timeout` 包装）
+- 修复 `win.rs` `SendInput` 返回值未处理（失败时 `log::warn`）
+- 修复 `linux.rs` uinput EV_SYN 配置静默失败
+- 修复 `linux.rs` Modifiers 修饰键信息丢失（添加 modifier 状态跟踪）
+- 修复 `network.rs` portscan 多线程写 String 无锁（Mutex 保护）
+- 修复 `mod.rs` Mount 命令被 `_ => debug!` 静默忽略
+- 修复 Clap 命令重复 `#[command(about = ...)]` 行
+- 修复 `fs.rs` `cmd_mkdir` 改用 `std::fs::create_dir_all`
 - 修复 network.rs 重复函数定义导致编译错误
 - 降级所有 crate edition 从 2024 到 2021（兼容性修复）
 - 转换 grep_walk 从递归到迭代（避免栈溢出）
@@ -26,10 +44,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - 修复 cmd_dmesg — 限制 /dev/kmsg 读取 64KB 并设置 2s 超时
 - 移除 ReliableSender::send 多余的 conn_id 参数
 - 修复 cmd_pkill signal 参数顺序（signal 放在 -f 之前）
-- P0 严重 bug + P1 性能优化 + P2 重构 + P3 文档
 
 ### Changed
 
+- `portscan` CLI 默认超时从 100ms 改为 500ms
 - 移除 cmd_watch_fn 未使用的 `_interval_secs` 参数
 - 移除 handle_control 未使用的 `_connections` 参数
 - 移除 Connection 冗余的 psk 字段及其参数
