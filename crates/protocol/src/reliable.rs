@@ -44,7 +44,7 @@ impl ReliableSender {
     }
 
     /// Queue a payload for reliable delivery. Returns the encoded packet (without crypto).
-    pub fn send(&mut self, conn_id: u64, payload: &[u8]) -> Option<BytesMut> {
+    pub fn send(&mut self, payload: &[u8]) -> Option<BytesMut> {
         if self.next_seq - self.window_base >= WINDOW_SIZE {
             return None; // Window full, caller should retry
         }
@@ -58,7 +58,7 @@ impl ReliableSender {
             acked: false,
         };
         self.slots.push_back(slot);
-        Some(Self::encode_packet(conn_id, self.stream_id, seq, payload))
+        Some(Self::encode_packet(self.conn_id, self.stream_id, seq, payload))
     }
 
     /// Process an incoming ACK. Returns newly-acked sequence numbers.
