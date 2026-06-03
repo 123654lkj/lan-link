@@ -1,0 +1,21 @@
+﻿[Unit]
+Description=lan-linkd - LAN link daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/lan-link/target/release/lan-linkd --port 9876
+Restart=always
+RestartSec=5
+User=root
+WorkingDirectory=/opt/lan-link
+StandardOutput=journal
+StandardError=journal
+
+# Security hardening
+NoNewPrivileges=false
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
