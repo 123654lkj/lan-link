@@ -73,14 +73,12 @@ impl ReliableSender {
                 slot.acked = true;
                 acked.push(slot.seq);
             } else if dist <= WINDOW_SIZE && (ack_bitmap & (1 << (dist - 1))) != 0 {
-                // seq is after ack_seq, within bitmap range: check bitmap
-                slot.acked = true;
-                acked.push(slot.seq);
-            } else if dist > WINDOW_SIZE && dist < u32::MAX - WINDOW_SIZE {
-                // seq is before ack_seq (wrapping case): receiver has moved past it
                 slot.acked = true;
                 acked.push(slot.seq);
             }
+            // dist > WINDOW_SIZE: seq is too far ahead (beyond bitmap range)
+            // or wrapped past ack_seq. Cannot confirm from this ACK;
+            // leave pending for retransmit timeout.
         }
         // Slide window
         while self.slots.front().map_or(false, |s| s.acked) {

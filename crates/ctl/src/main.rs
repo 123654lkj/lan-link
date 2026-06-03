@@ -150,7 +150,7 @@ enum Cmd {
     #[command(about = "查看远端网络接口")]
     Ip { #[arg(long)] addr: bool, #[arg(long)] route: bool, #[arg(long)] link: bool },
     #[command(about = "扫描远端 TCP 端口")]
-    PortScan { #[arg(default_value = "127.0.0.1")] host: String, #[arg(long, default_value = "1")] start_port: u16, #[arg(long, default_value = "1024")] end_port: u16, #[arg(long, default_value = "100")] timeout_ms: u64 },
+    PortScan { #[arg(default_value = "127.0.0.1")] host: String, #[arg(long, default_value = "1")] start_port: u16, #[arg(long, default_value = "1024")] end_port: u16, #[arg(long, default_value = "500")] timeout_ms: u64 },
     #[command(about = "查看远端 ARP 表")]
     Arp,
     #[command(about = "解析远端 DNS 查询")]
