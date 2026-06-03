@@ -1,7 +1,6 @@
 //! 连接管理
 //! 连接状态枚举、SYN-ACK 握手、心跳、数据包封装。
 
-use lan_link_protocol::crypto::Psk;
 use lan_link_protocol::frame::{PacketHeader, PacketType, Flags, StreamId, HEADER_SIZE};
 use lan_link_protocol::stream::StreamMux;
 use bytes::{BufMut, BytesMut};
@@ -15,7 +14,6 @@ pub enum ConnState { Listening, SynSent, Established, Closed }
 pub struct Connection {
     pub id: u64,
     pub peer: SocketAddr,
-    pub psk: Psk,
     pub state: ConnState,
     pub mux: StreamMux,
     pub created: Instant,
@@ -23,8 +21,8 @@ pub struct Connection {
 }
 
 impl Connection {
-    pub fn new(id: u64, peer: SocketAddr, psk: Psk) -> Self {
-        Self { id, peer, psk, state: ConnState::Listening, mux: StreamMux::new(),
+    pub fn new(id: u64, peer: SocketAddr) -> Self {
+        Self { id, peer, state: ConnState::Listening, mux: StreamMux::new(),
                created: Instant::now(), last_activity: Instant::now() }
     }
 

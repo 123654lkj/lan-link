@@ -135,7 +135,7 @@ async fn handle_packet_inner(
     match header.pkt_type {
         PacketType::Syn => {
             info!("SYN from {} (conn={})", peer, conn_id);
-            let conn = Connection::new(conn_id, peer, *psk);
+            let conn = Connection::new(conn_id, peer);
             let syn_ack = Connection::build_syn_ack(conn_id);
             connections.insert(conn_id, conn);
             let _ = send_socket.send_to(&syn_ack, peer).await;
