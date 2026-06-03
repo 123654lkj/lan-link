@@ -241,3 +241,9 @@ MIT
 - `native_cmd` 中的实现应优先使用纯 Rust 文件操作（如 `std::fs`），而非调用外部命令
 - 新增 `NativeCmdType` 变体时需同步更新 `ctl` 和 `daemon` 两侧的匹配逻辑
 - 所有加密解密操作必须通过 `protocol::crypto` 模块
+
+## 项目信息
+
+[![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Contributing](CONTRIBUTING.md)](CONTRIBUTING.md)
+[![Changelog](CHANGELOG.md)](CHANGELOG.md)
