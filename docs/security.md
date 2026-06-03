@@ -1,5 +1,8 @@
 # 安全模型
 
+> **平台支持说明**：当前 daemon（lan-linkd）仅支持 Linux。Windows 平台的支持为未来计划。
+> 以下安全机制（uinput 注入、`/proc` 读取、iptables 建议等）均基于 Linux 实现。
+
 ## 概述
 
 lan-link 的安全模型建立在 **预共享密钥（PSK）+ ChaCha20-Poly1305 AEAD 加密** 之上。所有控制数据、文件传输和输入事件均在 UDP 加密通道中传输，确保数据的机密性、完整性和认证性。
@@ -108,8 +111,8 @@ PSK 的分发必须通过安全的带外（out-of-band）方式进行：
 **客户端 (GUI)**：
 - PSK 保存在用户配置文件中
 - Linux: `~/.config/lan-link/gui-config.json`
-- Windows: `%APPDATA%/lan-link/gui-config.json`
 - ⚠️ 配置文件是 JSON 明文，不推荐 PSK 长期存储在 GUI 配置中
+- Windows 支持（未来计划）: `%APPDATA%/lan-link/gui-config.json`
 
 ### 轮换建议
 

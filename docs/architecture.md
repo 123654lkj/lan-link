@@ -4,6 +4,9 @@
 
 lan-link 采用 **Client-Daemon（客户端-守护进程）** 架构，所有通信基于 UDP 协议。
 
+> **平台支持说明**：当前 daemon（lan-linkd）仅支持 Linux 平台。Windows 支持为未来计划。
+> 客户端（lan-linkctl / lan-link-gui）可在 Linux 和 Windows 上编译运行。
+
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
 │                         Client 端                                    │
@@ -370,7 +373,7 @@ Client                           Daemon
 1. **远端正向执行**：daemon 内部通过 `std::fs` 等 Rust API 直接执行，无需外部命令
 2. **无 shell 注入风险**：参数是结构化的，不会出现 `$(rm -rf /)` 这样的注入
 3. **无解析成本**：结果直接以 `ExecChunk + ExecDone` 流式返回
-4. **跨平台一致**：同一命令在 Linux 和 Windows 上行为一致（即使底层实现不同）
+4. **跨平台一致**：同一命令在 Linux 和 Windows 上行为一致（即使底层实现不同。注意：当前仅支持 Linux，Windows 支持为未来计划。）
 5. **类型安全**：编译器确保所有参数类型正确
 
 ### 使用模式
@@ -491,7 +494,7 @@ pub fn run_native_cmd(cmd: &NativeCmdType) -> (Vec<u8>, Option<i32>) {
 4. 识别鼠标设备（支持 EV_REL 且包含 REL_X/REL_Y）
 5. 以非阻塞方式读取 24 字节的 `input_event` 结构
 
-### Windows (SendInput)
+### Windows (SendInput) [未来计划]
 
 ```
 客户端                              daemon (Windows)
