@@ -245,12 +245,8 @@ pub fn grep_walk(p: &std::path::Path, pat: &str, out: &mut String, t: &mut usize
                         if l.contains(pat) {
                             fm += 1;
                             if !cnt {
-                                let _line = if ln {
-                                    format!("{}:{}:{}\n", path.display(), i + 1, l)
-                                } else {
-                                    format!("{}:{}\n", path.display(), l)
-                                };
-                                out.push_str(&_line);
+                                // 递归模式统一输出 文件名:行号:内容
+                                out.push_str(&format!("{}:{}:{}\n", path.display(), i + 1, l));
                             }
                         }
                     }
