@@ -173,7 +173,10 @@ async fn handle_packet_inner(
             }
             let stream_id = header.stream_id;
             if stream_id == StreamId::Control as u16 {
-                handle_control(&plaintext, conn_id, peer, psk, &exec_map, send_socket.clone()).await;
+                let ctrl_seq = connections.get(&conn_id).map(|c| Arc::clone(&c.send_seq));
+                if let Some(seq) = ctrl_seq {
+                    handle_control(&plaintext, conn_id, peer, psk, &exec_map, send_socket.clone(), seq).await;
+                }
             } else if stream_id == StreamId::Input as u16 {
                 #[cfg(target_os = "linux")]
                 handle_input_linux(&plaintext, peer);
@@ -195,7 +198,7 @@ async fn handle_packet_inner(
 
 #[cfg(target_os = "linux")]
 use std::sync::OnceLock;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 #[cfg(target_os = "linux")]
@@ -235,17 +238,19 @@ async fn handle_control(
     data: &[u8], conn_id: u64, peer: SocketAddr,
     psk: &Psk, exec_map: &ExecMap,
     send_socket: Arc<UdpSocket>,
+    ctrl_seq: Arc<AtomicU64>,
 ) {
     let msg: ControlMsg = match bincode::deserialize(data) {
         Ok(m) => m, Err(e) => { warn!("Bad control msg: {}", e); return; }
     };
+    let next_seq = || ctrl_seq.fetch_add(1, Ordering::Relaxed);
     match msg {
         ControlMsg::Exec { id, cmd } => {
             info!("Exec #{}: {}", id, cmd);
             let se = match lan_link_shell::StreamingExec::spawn(&cmd) {
                 Ok(s) => s,
                 Err(e) => {
-                    let _ = send_control(conn_id, peer, psk, &ControlMsg::ExecDone { id, exit_code: None }, &send_socket).await;
+                    let _ = send_control(conn_id, peer, psk, next_seq(), &ControlMsg::ExecDone { id, exit_code: None }, &send_socket).await;
                     warn!("Exec #{} spawn failed: {}", id, e);
                     return;
                 }
@@ -253,8 +258,9 @@ async fn handle_control(
             let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<ExecCmd>();
             exec_map.lock().await.insert(id, cmd_tx);
             let psk2 = *psk;
-            tokio::spawn(run_exec_task(id, se, cmd_rx, conn_id, peer, psk2, send_socket.clone()));
-            let _ = send_control(conn_id, peer, psk, &ControlMsg::ExecStarted { id }, &send_socket).await;
+            let seq_clone = Arc::clone(&ctrl_seq);
+            tokio::spawn(run_exec_task(id, se, cmd_rx, conn_id, peer, psk2, send_socket.clone(), seq_clone));
+            let _ = send_control(conn_id, peer, psk, next_seq(), &ControlMsg::ExecStarted { id }, &send_socket).await;
         }
         ControlMsg::NativeSpawn { id, cmd } => {
             info!("NativeSpawn #{}: {:?}", id, cmd);
@@ -263,14 +269,14 @@ async fn handle_control(
                 NativeCmdType::Tail { path, lines, follow: true, .. } => format!("tail -n {} -f {}", lines, path),
                 _ => {
                     warn!("NativeSpawn #{}: unsupported cmd variant", id);
-                    let _ = send_control(conn_id, peer, psk, &ControlMsg::ExecDone { id, exit_code: None }, &send_socket).await;
+                    let _ = send_control(conn_id, peer, psk, next_seq(), &ControlMsg::ExecDone { id, exit_code: None }, &send_socket).await;
                     return;
                 }
             };
             let se = match lan_link_shell::StreamingExec::spawn(&cmd_str) {
                 Ok(s) => s,
                 Err(e) => {
-                    let _ = send_control(conn_id, peer, psk, &ControlMsg::ExecDone { id, exit_code: None }, &send_socket).await;
+                    let _ = send_control(conn_id, peer, psk, next_seq(), &ControlMsg::ExecDone { id, exit_code: None }, &send_socket).await;
                     warn!("NativeSpawn #{} spawn failed: {}", id, e);
                     return;
                 }
@@ -278,8 +284,9 @@ async fn handle_control(
             let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<ExecCmd>();
             exec_map.lock().await.insert(id, cmd_tx);
             let psk2 = *psk;
-            tokio::spawn(run_exec_task(id, se, cmd_rx, conn_id, peer, psk2, send_socket.clone()));
-            let _ = send_control(conn_id, peer, psk, &ControlMsg::ExecStarted { id }, &send_socket).await;
+            let seq_clone = Arc::clone(&ctrl_seq);
+            tokio::spawn(run_exec_task(id, se, cmd_rx, conn_id, peer, psk2, send_socket.clone(), seq_clone));
+            let _ = send_control(conn_id, peer, psk, next_seq(), &ControlMsg::ExecStarted { id }, &send_socket).await;
         }
         ControlMsg::ExecStdin { id, data, close } => {
             let map = exec_map.lock().await;
@@ -299,14 +306,14 @@ async fn handle_control(
                 warn!("Incompatible protocol version: client v{}, daemon v{}", version, PROTOCOL_VERSION);
                 return;
             }
-            send_control(conn_id, peer, psk, &ControlMsg::HelloAck { version: PROTOCOL_VERSION, capabilities: vec!["exec".into(), "input".into()] }, &send_socket).await;
+            let _ = send_control(conn_id, peer, psk, next_seq(), &ControlMsg::HelloAck { version: PROTOCOL_VERSION, capabilities: vec!["exec".into(), "input".into()] }, &send_socket).await;
         }
         ControlMsg::NativeCmd { id, cmd } => {
             let (out, exit) = native_cmd::run_native_cmd(&cmd);
-            send_control(conn_id, peer, psk, &ControlMsg::ExecChunk { id, stream: 0, data: out }, &send_socket).await;
-            send_control(conn_id, peer, psk, &ControlMsg::ExecDone { id, exit_code: exit }, &send_socket).await;
+            let _ = send_control(conn_id, peer, psk, next_seq(), &ControlMsg::ExecChunk { id, stream: 0, data: out }, &send_socket).await;
+            let _ = send_control(conn_id, peer, psk, next_seq(), &ControlMsg::ExecDone { id, exit_code: exit }, &send_socket).await;
         }
-        
+
         _ => debug!("Unhandled control: {:?}", msg),
     }
 }
@@ -323,6 +330,7 @@ async fn run_exec_task(
     peer: SocketAddr,
     psk: Psk,
     send_socket: Arc<UdpSocket>,
+    ctrl_seq: Arc<AtomicU64>,
 ) {
     // Bridge the std::sync::mpsc channels from StreamingExec to tokio channels,
     // so we can use tokio::select! instead of busy-polling.
@@ -351,14 +359,16 @@ async fn run_exec_task(
         });
     }
 
+    let next_seq = || ctrl_seq.fetch_add(1, Ordering::Relaxed);
+
     loop {
         tokio::select! {
             Some(chunk) = chunk_rx.recv() => {
                 let msg = ControlMsg::ExecChunk { id, stream: chunk.stream, data: chunk.data };
-                send_control(conn_id, peer, &psk, &msg, &send_socket).await;
+                send_control(conn_id, peer, &psk, next_seq(), &msg, &send_socket).await;
             }
             Ok(exit_code) = &mut done_rx => {
-                let _ = send_control(conn_id, peer, &psk, &ControlMsg::ExecDone { id, exit_code }, &send_socket).await;
+                let _ = send_control(conn_id, peer, &psk, next_seq(), &ControlMsg::ExecDone { id, exit_code }, &send_socket).await;
                 break;
             }
             cmd = cmd_rx.recv() => {
@@ -372,10 +382,11 @@ async fn run_exec_task(
     }
 }
 
-async fn send_control(conn_id: u64, peer: SocketAddr, psk: &Psk, msg: &ControlMsg, send_socket: &UdpSocket) {
+async fn send_control(conn_id: u64, peer: SocketAddr, psk: &Psk, seq: u64, msg: &ControlMsg, send_socket: &UdpSocket) {
     let payload = bincode::serialize(msg).unwrap();
-    let nonce = crypto::make_nonce(conn_id, 0);
+    let seq32 = seq as u32;
+    let nonce = crypto::make_nonce(conn_id, seq32);
     let encrypted = crypto::encrypt(psk, &nonce, &payload);
-    let packet = Connection::build_encrypted_data(conn_id, StreamId::Control as u16, 0, Flags::RELIABLE, &encrypted, nonce);
+    let packet = Connection::build_encrypted_data(conn_id, StreamId::Control as u16, seq32, Flags::RELIABLE, &encrypted, nonce);
     let _ = send_socket.send_to(&packet, peer).await;
 }

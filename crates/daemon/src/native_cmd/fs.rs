@@ -231,7 +231,7 @@ pub fn cmd_grep(
     )
 }
 
-pub fn grep_walk(p: &std::path::Path, pat: &str, out: &mut String, t: &mut usize, ln: bool, cnt: bool) {
+pub fn grep_walk(p: &std::path::Path, pat: &str, out: &mut String, t: &mut usize, _ln: bool, cnt: bool) {
     let mut stack = vec![p.to_path_buf()];
     while let Some(dir) = stack.pop() {
         if let Ok(entries) = std::fs::read_dir(&dir) {

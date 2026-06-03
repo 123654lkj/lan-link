@@ -6,6 +6,8 @@ use lan_link_protocol::stream::StreamMux;
 use bytes::{BufMut, BytesMut};
 use rand::RngCore;
 use std::net::SocketAddr;
+use std::sync::atomic::AtomicU64;
+use std::sync::Arc;
 use std::time::Instant;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -18,12 +20,14 @@ pub struct Connection {
     pub mux: StreamMux,
     pub created: Instant,
     pub last_activity: Instant,
+    pub send_seq: Arc<AtomicU64>,
 }
 
 impl Connection {
     pub fn new(id: u64, peer: SocketAddr) -> Self {
         Self { id, peer, state: ConnState::Listening, mux: StreamMux::new(),
-               created: Instant::now(), last_activity: Instant::now() }
+               created: Instant::now(), last_activity: Instant::now(),
+               send_seq: Arc::new(AtomicU64::new(0)) }
     }
 
     pub fn build_syn(conn_id: u64) -> BytesMut {

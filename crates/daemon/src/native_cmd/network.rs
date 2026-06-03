@@ -57,7 +57,6 @@ pub fn cmd_portscan(host: &str, start: u16, end: u16) -> (Vec<u8>, Option<i32>) 
 
     std::thread::scope(|s| {
         for _ in 0..max_threads {
-            let host = host.to_string();
             s.spawn(|| {
                 loop {
                     let port = next_port.fetch_add(1, Ordering::Relaxed);
@@ -67,7 +66,7 @@ pub fn cmd_portscan(host: &str, start: u16, end: u16) -> (Vec<u8>, Option<i32>) 
                     if let Ok(addr) = format!("{}:{}", host, port).parse::<std::net::SocketAddr>() {
                         if TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(200)).is_ok() {
                             let mut r = results.lock().unwrap();
-                            r += &format!("Port {} is open\n", port);
+                            r.push_str(&format!("Port {} is open\n", port));
                         }
                     }
                 }
