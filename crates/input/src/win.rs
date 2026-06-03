@@ -57,7 +57,10 @@ impl InputInjector for WinInputInjector {
             input.Anonymous.ki.wScan = event.scancode;
             if !event.down { input.Anonymous.ki.dwFlags = KEYEVENTF_KEYUP; }
             let inputs = [input];
-            SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
+            let rc = SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
+            if rc == 0 {
+                log::warn!("SendInput (key) returned 0, injection may have failed");
+            }
         }
         0
     }
@@ -88,7 +91,10 @@ impl InputInjector for WinInputInjector {
                 }
             }
             let inputs = [input];
-            SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
+            let rc = SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
+            if rc == 0 {
+                log::warn!("SendInput (mouse) returned 0, injection may have failed");
+            }
         }
         0
     }

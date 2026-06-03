@@ -344,10 +344,22 @@ pub fn cmd_rm(recursive: bool, force: bool, paths: &[String]) -> (Vec<u8>, Optio
 }
 
 pub fn cmd_mkdir(recursive: bool, paths: &[String]) -> (Vec<u8>, Option<i32>) {
-    let mut args = vec![];
-    if recursive { args.push("-p"); }
-    for p in paths { args.push(p); }
-    run_cmd("/usr/bin/mkdir", &args)
+    let mut out = String::new();
+    for p in paths {
+        if recursive {
+            match std::fs::create_dir_all(p) {
+                Ok(_) => {}
+                Err(e) => out.push_str(&format!("mkdir: {}: {}\n", p, e)),
+            }
+        } else {
+            match std::fs::create_dir(p) {
+                Ok(_) => {}
+                Err(e) => out.push_str(&format!("mkdir: {}: {}\n", p, e)),
+            }
+        }
+    }
+    let exit = if out.is_empty() { Some(0) } else { Some(1) };
+    (out.into_bytes(), exit)
 }
 
 pub fn cmd_chmod(mode: &str, paths: &[String]) -> (Vec<u8>, Option<i32>) {

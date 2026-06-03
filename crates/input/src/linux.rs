@@ -13,12 +13,13 @@ pub struct LinuxInputCapture {
     mouse_devices: Vec<File>,
     last_x: i32,
     last_y: i32,
+    modifiers: crate::Modifiers,
 }
 
 impl LinuxInputCapture {
     pub fn new() -> Self {
         let (kb, mouse) = find_input_devices();
-        Self { kb_devices: kb, mouse_devices: mouse, last_x: 0, last_y: 0 }
+        Self { kb_devices: kb, mouse_devices: mouse, last_x: 0, last_y: 0, modifiers: crate::Modifiers::empty() }
     }
 }
 
@@ -102,12 +103,19 @@ impl InputCapture for LinuxInputCapture {
                         let value = i32::from_ne_bytes(buf[20..24].try_into().unwrap());
 
                         if ev_type == 1 {
-                            // EV_KEY
+                            // EV_KEY — track modifier state first
+                            match code {
+                                0x1D | 0x61 => { self.modifiers.set(crate::Modifiers::CTRL, value != 0); }
+                                0x2A | 0x36 => { self.modifiers.set(crate::Modifiers::SHIFT, value != 0); }
+                                0x38 | 0x64 => { self.modifiers.set(crate::Modifiers::ALT, value != 0); }
+                                0x7D | 0x7E => { self.modifiers.set(crate::Modifiers::WIN, value != 0); }
+                                _ => {}
+                            }
                             events.push(KeyEvent {
                                 down: value != 0,
                                 scancode: code,
                                 vk: code,
-                                modifiers: crate::Modifiers::empty(),
+                                modifiers: self.modifiers,
                             });
                         }
                     }
@@ -272,10 +280,9 @@ impl LinuxInputInjector {
                 let raw = f.as_raw_fd();
                 // Configure device capabilities
                 unsafe {
-                    // EV_KEY, EV_REL, EV_SYN, EV_MSC
+                    // EV_KEY, EV_REL
                     libc::ioctl(raw, UI_SET_EVBIT, 0x01); // EV_KEY
                     libc::ioctl(raw, UI_SET_EVBIT, 0x02); // EV_REL
-                    libc::ioctl(raw, UI_SET_EVBIT, 0x00); // EV_SYN
 
                     // Key bits: all keys
                     for i in 0..768u16 {

@@ -220,8 +220,21 @@ async fn handle_packet_inner(
                 warn!("MAX_CONNECTIONS ({}) reached, rejecting SYN from {}", MAX_CONNECTIONS, peer);
                 return;
             }
+            // Check if conn_id already exists from a different peer
+            if let Some(existing) = connections.get(&conn_id) {
+                if existing.peer != peer {
+                    warn!("SYN for existing conn {} from different peer {}, ignoring", conn_id, peer);
+                    return;
+                }
+                // Same peer: refresh
+                info!("SYN refresh from {} (conn={})", peer, conn_id);
+                let syn_ack = Connection::build_syn_ack(conn_id);
+                let _ = send_socket.send_to(&syn_ack, peer).await;
+                return;
+            }
             info!("SYN from {} (conn={})", peer, conn_id);
-            let conn = Connection::new(conn_id, peer);
+            let mut conn = Connection::new(conn_id, peer);
+            conn.state = ConnState::Established;
             let syn_ack = Connection::build_syn_ack(conn_id);
             connections.insert(conn_id, conn);
             let _ = send_socket.send_to(&syn_ack, peer).await;
@@ -234,6 +247,11 @@ async fn handle_packet_inner(
             }
         }
         PacketType::Data => {
+            // Only process Data on established connections
+            match connections.get(&conn_id) {
+                Some(conn) if conn.state == ConnState::Established => {}
+                _ => { warn!("Data on non-established conn {} from {}", conn_id, peer); return; }
+            }
             let enc_start = HEADER_SIZE;
             if data.len() <= enc_start { return; }
             let ciphertext = &data[enc_start..];
@@ -263,6 +281,9 @@ async fn handle_packet_inner(
         }
         PacketType::Heartbeat => {
             if let Some(conn) = connections.get_mut(&conn_id) {
+                if conn.state != ConnState::Established {
+                    return;
+                }
                 conn.last_activity = Instant::now();
                 let hb = Connection::build_heartbeat(conn_id);
                 let _ = send_socket.send_to(&hb, conn.peer).await;
@@ -343,7 +364,13 @@ async fn handle_control(
             info!("NativeSpawn #{}: {:?}", id, cmd);
             let cmd_str = match &cmd {
                 NativeCmdType::ShellExec { cmd, .. } => cmd.clone(),
-                NativeCmdType::Tail { path, lines, follow: true, .. } => format!("tail -n {} -f {}", lines, path),
+                NativeCmdType::Tail { path, lines, follow: true, follow_secs } => {
+                    if *follow_secs > 0 {
+                        format!("timeout {} tail -n {} -f {}", follow_secs, lines, path)
+                    } else {
+                        format!("tail -n {} -f {}", lines, path)
+                    }
+                }
                 _ => {
                     warn!("NativeSpawn #{}: unsupported cmd variant", id);
                     let _ = send_control(conn_id, peer, psk, next_seq(), &ControlMsg::ExecDone { id, exit_code: None }, &send_socket).await;

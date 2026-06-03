@@ -57,7 +57,6 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Cmd {
     #[command(about = "远程执行命令，等待完成后输出")]
-    #[command(about = "在容器内执行命令")]
     Exec {
         #[arg(allow_hyphen_values = true, num_args = 1.., help = "要执行的命令")]
         cmd: Vec<String>,
@@ -117,7 +116,6 @@ enum Cmd {
     #[command(about = "在远端创建目录")]
     Mkdir { #[arg(short)] recursive: bool, paths: Vec<String> },
     #[command(about = "删除远端文件或目录")]
-    #[command(about = "删除容器")]
     Rm { #[arg(short)] recursive: bool, #[arg(short)] force: bool, paths: Vec<String> },
     #[command(about = "移动或重命名远端文件")]
     Mv { src: String, dest: String },
@@ -136,7 +134,6 @@ enum Cmd {
     #[command(about = "统计远端文件行数或字数")]
     Wc { #[arg(short, long)] lines: bool, #[arg(short, long)] words: bool, paths: Vec<String> },
     #[command(about = "列出远端进程")]
-    #[command(about = "列出容器")]
     Ps { #[arg(short, long)] full: bool, #[arg(long)] user: Option<String>, #[arg(long)] tree: bool },
     #[command(about = "终止远端进程")]
     Kill { pid: u32, #[arg(short, default_value = "15")] signal: u32 },
@@ -159,7 +156,6 @@ enum Cmd {
     #[command(about = "解析远端 DNS 查询")]
     Dns { hostname: String, #[arg(long)] type_: Option<String> },
     #[command(about = "显示远端系统概要信息")]
-    #[command(about = "Docker 系统信息")]
     Info,
     #[command(about = "显示远端内核信息")]
     Uname { #[arg(short, long)] all: bool, #[arg(short = 'r', long)] release: bool, #[arg(short = 'm', long)] machine: bool },
@@ -202,7 +198,6 @@ enum Cmd {
     #[command(about = "给正在运行的 exec 发送信号")]
     Signal { id: u32, #[arg(short, default_value = "15")] signal: u32 },
     #[command(about = "测试与 daemon 的连接状态")]
-    #[command(about = "查看指定服务状态")]
     Status,
     #[command(about = "显示本客户端版本号")]
     Version,
@@ -220,9 +215,7 @@ enum Cmd {
 #[derive(Subcommand, Debug)]
 enum ServiceAction {
     #[command(about = "列出服务（--active 运行中 / --failed 失败）")]
-    #[command(about = "列出已安装包")]
     List { #[arg(long)] active: bool, #[arg(long)] failed: bool },
-    #[command(about = "测试与 daemon 的连接状态")]
     #[command(about = "查看指定服务状态")]
     Status { name: String },
     #[command(about = "启动指定服务")]
@@ -241,7 +234,6 @@ enum ServiceAction {
 
 #[derive(Subcommand, Debug)]
 enum PkgAction {
-    #[command(about = "列出服务（--active 运行中 / --failed 失败）")]
     #[command(about = "列出已安装包")]
     List { #[arg(long)] installed: bool },
     #[command(about = "搜索软件包")]
@@ -258,22 +250,18 @@ enum PkgAction {
 
 #[derive(Subcommand, Debug)]
 enum DockerAction {
-    #[command(about = "列出远端进程")]
     #[command(about = "列出容器")]
     Ps { #[arg(short, long)] all: bool, #[arg(long)] running: bool },
     #[command(about = "查看容器日志")]
     Logs { name: String, #[arg(long, default_value = "100")] tail: u32, #[arg(short, long)] follow: bool },
     #[command(about = "容器资源统计")]
     Stats { #[arg(long, default_value = "2")] interval_secs: u64 },
-    #[command(about = "远程执行命令，等待完成后输出")]
     #[command(about = "在容器内执行命令")]
     Exec { container: String, #[arg(allow_hyphen_values = true, num_args = 1..)] cmd: Vec<String> },
-    #[command(about = "显示远端系统概要信息")]
     #[command(about = "Docker 系统信息")]
     Info,
     #[command(about = "镜像列表")]
     Images,
-    #[command(about = "删除远端文件或目录")]
     #[command(about = "删除容器")]
     Rm { container: String, #[arg(short, long)] force: bool },
     #[command(about = "控制容器（start/stop/pause 等）")]
@@ -282,13 +270,10 @@ enum DockerAction {
 
 #[derive(Subcommand, Debug)]
 enum CrontabAction {
-    #[command(about = "列出服务（--active 运行中 / --failed 失败）")]
-    #[command(about = "列出已安装包")]
     #[command(about = "查看 crontab")]
     List,
     #[command(about = "编辑 crontab")]
     Edit,
-    #[command(about = "卸载软件包")]
     #[command(about = "移除 crontab")]
     Remove,
 }
@@ -459,7 +444,12 @@ async fn read_stdin_line() -> io::Result<String> {
     let mut line = String::new();
     let n = reader.read_line(&mut line).await?;
     if n == 0 { return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "EOF")); }
-    Ok(line.trim_end_matches(|c| c == '\n' || c == '\r').to_string())
+    // Keep trailing newline so the remote shell executes the command
+    // Trim only \r (Windows line endings), preserve \n
+    if line.ends_with('\r') {
+        line.truncate(line.len() - 1);
+    }
+    Ok(line)
 }
 
 
@@ -801,16 +791,26 @@ async fn cmd_push(ctx: &mut Ctx, local: &str, remote: &str) -> anyhow::Result<()
     let mut last_pct: usize = 0;
     while offset < total as u64 {
         let end = ((offset as usize) + CHUNK_SIZE).min(total);
-        ctx.send_control(&ControlMsg::FileChunk { id: file_id, offset, data: data[offset as usize..end].to_vec() }).await?;
-        // Wait for ACK with retry (up to 5s per chunk)
-        let ack_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        let mut acked = false;
-        while !acked && std::time::Instant::now() < ack_deadline {
-            if let Ok(Some(msg)) = ctx.recv_control(std::time::Duration::from_millis(500)).await {
-                if let ControlMsg::FileAck { id, offset: ack_off } = msg {
-                    if id == file_id && ack_off >= end as u64 { acked = true; }
+        // Send chunk with retry (up to 3 retries, increasing intervals)
+        let mut chunk_acked = false;
+        for retry in 0..4 {
+            if retry > 0 {
+                info!("Push #{}: retry {}/3 for offset {}", file_id, retry, offset);
+            }
+            ctx.send_control(&ControlMsg::FileChunk { id: file_id, offset, data: data[offset as usize..end].to_vec() }).await?;
+            let timeout = std::time::Duration::from_secs(1 + retry as u64 * 2); // 1s, 3s, 5s
+            let ack_deadline = std::time::Instant::now() + timeout;
+            while !chunk_acked && std::time::Instant::now() < ack_deadline {
+                if let Ok(Some(msg)) = ctx.recv_control(std::time::Duration::from_millis(500)).await {
+                    if let ControlMsg::FileAck { id, offset: ack_off } = msg {
+                        if id == file_id && ack_off >= end as u64 { chunk_acked = true; }
+                    }
                 }
             }
+            if chunk_acked { break; }
+        }
+        if !chunk_acked {
+            anyhow::bail!("Push #{}: chunk at offset {} not ACKed after 3 retries", file_id, offset);
         }
         offset = end as u64;
         // Progress bar - uses \r as escape sequence (two chars: \ + r)

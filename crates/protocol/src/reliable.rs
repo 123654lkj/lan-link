@@ -72,7 +72,12 @@ impl ReliableSender {
             if dist == 0 {
                 slot.acked = true;
                 acked.push(slot.seq);
-            } else if dist <= 32 && (ack_bitmap & (1 << (dist - 1))) != 0 {
+            } else if dist <= WINDOW_SIZE && (ack_bitmap & (1 << (dist - 1))) != 0 {
+                // seq is after ack_seq, within bitmap range: check bitmap
+                slot.acked = true;
+                acked.push(slot.seq);
+            } else if dist > WINDOW_SIZE && dist < u32::MAX - WINDOW_SIZE {
+                // seq is before ack_seq (wrapping case): receiver has moved past it
                 slot.acked = true;
                 acked.push(slot.seq);
             }
@@ -166,7 +171,7 @@ impl ReliableReceiver {
                 }
             }
             results
-        } else if dist <= WINDOW_SIZE {
+        } else if dist > 0 && dist <= WINDOW_SIZE {
             // Out of order within window, buffer it
             let insert_pos = self.ooo_buffer.iter().position(|(s, _)| {
                 seq.wrapping_sub(*s) < dist
