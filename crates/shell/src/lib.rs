@@ -62,8 +62,8 @@ pub fn exec_with_input(cmd: &str, args: &[&str], stdin_data: &[u8]) -> anyhow::R
 
 pub struct StreamingExec {
     child: Arc<Mutex<Option<std::process::Child>>>,
-    chunks_rx: mpsc::Receiver<StreamChunk>,
-    done_rx: mpsc::Receiver<Option<i32>>,
+    chunks_rx: Arc<Mutex<Option<mpsc::Receiver<StreamChunk>>>>,
+    done_rx: Arc<Mutex<Option<mpsc::Receiver<Option<i32>>>>>,
     stdin_arc: Arc<Mutex<Option<std::process::ChildStdin>>>,
 }
 
@@ -136,18 +136,19 @@ impl StreamingExec {
 
         Ok(StreamingExec {
             child: child_arc,
-            chunks_rx,
-            done_rx,
+            chunks_rx: Arc::new(Mutex::new(Some(chunks_rx))),
+            done_rx: Arc::new(Mutex::new(Some(done_rx))),
             stdin_arc: Arc::new(Mutex::new(Some(stdin))),
         })
     }
 
     pub fn try_poll_chunk(&self) -> Option<StreamChunk> {
-        self.chunks_rx.try_recv().ok()
+        self.chunks_rx.lock().ok()?.as_mut()?.try_recv().ok()
     }
 
     pub fn try_wait(&self) -> Option<Option<i32>> {
-        match self.done_rx.try_recv() {
+        let rx = self.done_rx.lock().ok()?;
+        match rx.as_ref()?.try_recv() {
             Ok(code) => Some(code),
             Err(mpsc::TryRecvError::Empty) => None,
             Err(mpsc::TryRecvError::Disconnected) => Some(None),
@@ -155,7 +156,19 @@ impl StreamingExec {
     }
 
     pub fn wait(&self) -> Option<i32> {
-        self.done_rx.recv().ok().flatten()
+        self.done_rx.lock().ok()?.as_mut()?.recv().ok().flatten()
+    }
+
+    /// Take the internal chunk receiver for use in a blocking thread.
+    /// After this call, try_poll_chunk will return None.
+    pub fn take_chunks_rx(&self) -> Option<mpsc::Receiver<StreamChunk>> {
+        self.chunks_rx.lock().ok()?.take()
+    }
+
+    /// Take the internal done receiver for use in a blocking thread.
+    /// After this call, try_wait / wait will return None.
+    pub fn take_done_rx(&self) -> Option<mpsc::Receiver<Option<i32>>> {
+        self.done_rx.lock().ok()?.take()
     }
 
     pub fn kill(&self) -> anyhow::Result<()> {

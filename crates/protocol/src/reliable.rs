@@ -25,6 +25,7 @@ struct SendSlot {
 
 /// Reliable send state for one stream.
 pub struct ReliableSender {
+    conn_id: u64,
     stream_id: u16,
     next_seq: u32,
     window_base: u32,
@@ -32,8 +33,9 @@ pub struct ReliableSender {
 }
 
 impl ReliableSender {
-    pub fn new(stream_id: u16) -> Self {
+    pub fn new(conn_id: u64, stream_id: u16) -> Self {
         Self {
+            conn_id,
             stream_id,
             next_seq: 0,
             window_base: 0,
@@ -95,7 +97,7 @@ impl ReliableSender {
             if now.duration_since(slot.sent_at) >= RTO {
                 slot.retries += 1;
                 slot.sent_at = now;
-                retrans.push((0, self.stream_id, slot.seq, slot.data.clone()));
+                retrans.push((self.conn_id, self.stream_id, slot.seq, slot.data.clone()));
             }
         }
         retrans

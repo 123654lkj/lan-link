@@ -39,7 +39,7 @@ impl Default for HostConfig {
         Self {
             name: "tuanzi".into(),
             addr: "192.168.31.244:9876".into(),
-            psk_hex: "ca989e3c0e5f763c1ba7f3a8308a9445ca1d5b77a3e896d55e4eac86f25dfb1d".into(),
+            psk_hex: String::new(),
         }
     }
 }
@@ -57,7 +57,7 @@ impl Default for AppConfig {
         hosts.push(HostConfig {
             name: "localhost".into(),
             addr: "127.0.0.1:9876".into(),
-            psk_hex: "ca989e3c0e5f763c1ba7f3a8308a9445ca1d5b77a3e896d55e4eac86f25dfb1d".into(),
+            psk_hex: String::new(),
         });
         Self { hosts, active_host: 0, timeout_secs: 30 }
     }
@@ -115,7 +115,13 @@ pub struct Connection {
 
 impl Connection {
     pub async fn connect(host: &HostConfig) -> anyhow::Result<Self> {
-        let psk_bytes = hex::decode(host.psk_hex.trim())?;
+        let psk_hex = if host.psk_hex.trim().is_empty() {
+            std::env::var("LAN_LINK_PSK")
+                .map_err(|_| anyhow::anyhow!("PSK 未设置：请在配置中填写 PSK 或设置 LAN_LINK_PSK 环境变量"))?
+        } else {
+            host.psk_hex.clone()
+        };
+        let psk_bytes = hex::decode(psk_hex.trim())?;
         anyhow::ensure!(psk_bytes.len() == 32, "PSK must be 32 bytes hex");
         let mut psk: Psk = [0u8; 32];
         psk.copy_from_slice(&psk_bytes);

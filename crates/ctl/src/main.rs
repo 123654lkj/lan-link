@@ -12,8 +12,19 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::UdpSocket;
 use tracing::{info, warn};
 
-const PSK_HEX: &str = "ca989e3c0e5f763c1ba7f3a8308a9445ca1d5b77a3e896d55e4eac86f25dfb1d";
 const CHUNK_SIZE: usize = 1024;
+
+/// Resolve PSK from --psk argument or LAN_LINK_PSK env var; exit if neither is set.
+fn resolve_psk(psk_arg: &Option<String>) -> String {
+    if let Some(hex) = psk_arg {
+        return hex.clone();
+    }
+    if let Ok(hex) = std::env::var("LAN_LINK_PSK") {
+        return hex;
+    }
+    eprintln!("错误: 未设置 PSK。请通过 --psk 参数或 LAN_LINK_PSK 环境变量提供 32 字节 hex 密钥");
+    std::process::exit(1);
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "lan-linkctl", version, about = "LAN link 远程管理客户端")]
@@ -22,8 +33,8 @@ struct Cli {
     verbose: bool,
     #[arg(short, long, default_value = "192.168.31.244:9876", help = "目标 daemon 地址 host:port")]
     addr: String,
-    #[arg(short, long, default_value = PSK_HEX, help = "32 字节 PSK hex 字符串")]
-    psk: String,
+    #[arg(short, long, help = "32 字节 PSK hex 字符串（默认从 LAN_LINK_PSK 环境变量读取）")]
+    psk: Option<String>,
     #[command(subcommand)]
     command: Cmd,
 }
@@ -445,7 +456,8 @@ async fn main() -> anyhow::Result<()> {
     let filter = if cli.verbose { EnvFilter::new("info") } else { EnvFilter::new("error") };
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
-    macro_rules! new_ctx { () => { Ctx::new(&cli.addr, &cli.psk).await? }; }
+    let resolved_psk = resolve_psk(&cli.psk);
+    macro_rules! new_ctx { () => { Ctx::new(&cli.addr, &resolved_psk).await? }; }
     macro_rules! nc { ($ctx:expr, $cmd:expr) => { native_run($ctx, 1, $cmd, 30).await? }; ($ctx:expr, $cmd:expr, $to:expr) => { native_run($ctx, 1, $cmd, $to).await? }; }
 
     match cli.command {
@@ -474,7 +486,7 @@ async fn main() -> anyhow::Result<()> {
                 let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(jobs as usize));
                 let mut handles = Vec::new();
                 let addr = cli.addr.clone();
-                let psk_hex = cli.psk.clone();
+                let psk_hex = resolved_psk.clone();
                 for i in 0..total_cmds {
                     let line = lines[i].clone();
                     let permit = sem.clone().acquire_owned().await.expect("sem");
