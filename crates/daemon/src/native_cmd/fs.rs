@@ -217,28 +217,30 @@ pub fn cmd_grep(
 }
 
 pub fn grep_walk(p: &std::path::Path, pat: &str, out: &mut String, t: &mut usize, ln: bool, cnt: bool) {
-    if let Ok(entries) = std::fs::read_dir(p) {
-        for entry in entries.filter_map(|e| e.ok()) {
-            if entry.path().is_dir() {
-                grep_walk(&entry.path(), pat, out, t, ln, cnt);
-            } else if let Ok(c) = std::fs::read_to_string(&entry.path()) {
-                let mut fm = 0usize;
-
-                for (i, l) in c.lines().enumerate() {
-                    if l.contains(pat) {
-                        fm += 1;
-                        if !cnt {
-                            let _line = if ln {
-                                format!("{}:{}:{}\n", entry.path().display(), i + 1, l)
-                            } else {
-                                format!("{}:{}\n", entry.path().display(), l)
-                            };
-                            out.push_str(&_line);
+    let mut stack = vec![p.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.filter_map(|e| e.ok()) {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if let Ok(c) = std::fs::read_to_string(&path) {
+                    let mut fm = 0usize;
+                    for (i, l) in c.lines().enumerate() {
+                        if l.contains(pat) {
+                            fm += 1;
+                            if !cnt {
+                                let _line = if ln {
+                                    format!("{}:{}:{}\n", path.display(), i + 1, l)
+                                } else {
+                                    format!("{}:{}\n", path.display(), l)
+                                };
+                                out.push_str(&_line);
+                            }
                         }
                     }
+                    *t += fm;
                 }
-
-                *t += fm;
             }
         }
     }
