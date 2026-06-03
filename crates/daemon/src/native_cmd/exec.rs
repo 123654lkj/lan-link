@@ -1,4 +1,17 @@
-// exec module
+//! Shell 执行和批处理命令
+//!
+//! 提供 shell 命令执行相关的原生实现，包括：
+//!
+//! - **Shell 执行**：`shell_exec` — 通过 `/bin/sh -c` 执行任意命令
+//! - **批量执行**：`batch_content` — 批量执行预定义命令集
+//! - **监视执行**：`watch_fn` — 周期执行并返回结果
+//! - **文本替换**：`sed` — 基于内存的字符串替换（包含 `..` 路径安全检查）
+//! - **进程终止**：`pkill` — 通过 pkill 工具按名称终止进程
+//!
+//! # 安全注意
+//!
+//! `shell_exec` 和 `watch_fn` 会调用外部 shell，存在注入风险。
+//! 优先使用其他结构化的 NativeCmd 变体。
 
 pub fn cmd_watch_fn(cmds: &[String]) -> (Vec<u8>, Option<i32>) {
     let joined = cmds.join(" ");

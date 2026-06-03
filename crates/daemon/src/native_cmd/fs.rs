@@ -1,3 +1,14 @@
+//! 文件系统操作命令
+//!
+//! 提供所有文件系统相关的原生命令实现，包括：
+//!
+//! - **文件操作**：`cat`、`head`、`tail`、`touch`、`write_file`、`read_file`
+//! - **目录操作**：`ls`、`find`、`tree`、`mkdir`、`rm`、`mv`、`cp`
+//! - **文件元数据**：`stat`、`du`、`df`、`chmod`、`chown`
+//! - **搜索与比较**：`grep`、`diff`、`wc`
+//!
+//! 所有操作优先使用 `std::fs` Rust API，避免外部命令调用。
+
 use crate::native_cmd::helper::run_cmd;
 use std::io::Write;
 

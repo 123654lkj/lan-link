@@ -1,4 +1,15 @@
-// service module
+//! 服务管理命令
+//!
+//! 提供服务管理相关的原生命令实现，包括：
+//!
+//! - **系统服务**：`service` — systemd 服务管理（start/stop/restart/status/enable/disable）
+//! - **日志查询**：`journal` — journalctl 日志查询，支持按等级/时间过滤
+//! - **包管理**：`pkg` — apt/dnf 包管理器操作
+//! - **容器管理**：`docker` — Docker 容器和镜像管理
+//! - **定时任务**：`crontab` — crontab 查看和编辑
+//! - **防火墙**：`firewall` — iptables/nftables 规则查询
+//!
+//! 服务管理命令通过 `std::process::Command` 调用系统工具实现。
 
 pub fn cmd_service(action: &lan_link_protocol::frame::ServiceActionType) -> (Vec<u8>, Option<i32>) {
     use lan_link_protocol::frame::ServiceActionType;

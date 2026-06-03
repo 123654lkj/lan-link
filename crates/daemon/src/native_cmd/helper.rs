@@ -1,3 +1,11 @@
+//! 工具函数
+//!
+//! 提供 `native_cmd` 各模块共享的辅助函数：
+//!
+//! - [`read_proc`] — 读取 `/proc` 文件系统的便捷包装
+//! - [`run_cmd`] — 执行外部命令并获取输出
+//! - [`hfmt`] — 字节大小的人类可读格式化（B/K/M/G）
+
 use std::process::Command;
 
 pub fn read_proc(path: &str) -> String {

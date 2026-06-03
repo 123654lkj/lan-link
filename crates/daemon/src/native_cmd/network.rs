@@ -1,3 +1,13 @@
+//! 网络工具命令
+//!
+//! 提供网络相关的原生命令实现，包括：
+//!
+//! - **DNS 查询**：`dns` — 通过 `std::net::lookup_host` 解析域名
+//! - **端口扫描**：`portscan` — 并发 TCP 连接扫描，最多 100 并发
+//! - **网络状态**：`netstat` — 读取 `/proc/net/tcp`、`/proc/net/udp`
+//! - **ARP 表**：`arp` — 读取 `/proc/net/arp`
+//! - **SSH 检查**：`ssh` — 检测 SSH 服务是否运行
+
 use crate::native_cmd::helper::read_proc;
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicU16, Ordering};

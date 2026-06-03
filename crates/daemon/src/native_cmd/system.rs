@@ -1,3 +1,14 @@
+//! 系统信息命令
+//!
+//! 提供所有系统相关的原生命令实现，包括：
+//!
+//! - **系统状态**：`uptime`、`hostname`、`free`、`cpu`、`uname`、`whoami`
+//! - **进程管理**：`ps`、`top`、`kill`、`pgrep`
+//! - **诊断工具**：`dmesg`、`lsblk`、`mount`、`who`、`last`、`ip`
+//! - **其他**：`info`、`checksum`
+//!
+//! 系统信息主要从 `/proc` 文件系统读取，使用纯 Rust 解析。
+
 use crate::native_cmd::helper::{read_proc, hfmt};
 
 pub fn cmd_uptime() -> (Vec<u8>, Option<i32>) {
