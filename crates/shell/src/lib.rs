@@ -191,7 +191,9 @@ impl StreamingExec {
         let mut guard = self.stdin_arc.lock().unwrap();
         if let Some(stdin) = guard.as_mut() {
             stdin.write_all(data)?;
-            if close { *guard = None; }
+        }
+        if close {
+            drop(guard.take()); // take and drop stdin, ensuring close works even if already taken
         }
         Ok(())
     }

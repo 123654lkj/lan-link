@@ -21,7 +21,7 @@ impl MuxStream {
 
     pub fn next_seq(&mut self) -> u32 {
         let seq = self.send_seq;
-        self.send_seq = self.send_seq.wrapping_add(1);
+        self.send_seq = self.send_seq.saturating_add(1);
         seq
     }
 }

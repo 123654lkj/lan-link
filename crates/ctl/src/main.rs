@@ -37,7 +37,14 @@ fn resolve_psk(psk_arg: &Option<String>) -> String {
     if let Ok(hex) = std::env::var("LAN_LINK_PSK") {
         return hex;
     }
-    eprintln!("错误: 未设置 PSK。请通过 --psk 参数或 LAN_LINK_PSK 环境变量提供 32 字节 hex 密钥");
+    // Fallback: try reading from default daemon PSK file
+    if let Ok(hex) = std::fs::read_to_string("/etc/lan-link/psk") {
+        let trimmed = hex.trim().to_string();
+        if !trimmed.is_empty() {
+            return trimmed;
+        }
+    }
+    eprintln!("错误: 未设置 PSK。请通过 --psk 参数、LAN_LINK_PSK 环境变量或 /etc/lan-link/psk 文件提供 32 字节 hex 密钥");
     std::process::exit(1);
 }
 
@@ -257,7 +264,7 @@ enum DockerAction {
     #[command(about = "容器资源统计")]
     Stats { #[arg(long, default_value = "2")] interval_secs: u64 },
     #[command(about = "在容器内执行命令")]
-    Exec { container: String, #[arg(allow_hyphen_values = true, num_args = 1..)] cmd: Vec<String> },
+    Exec { container: String, #[arg(short, long)] interactive: bool, #[arg(allow_hyphen_values = true, num_args = 1..)] cmd: Vec<String> },
     #[command(about = "Docker 系统信息")]
     Info,
     #[command(about = "镜像列表")]
@@ -331,7 +338,7 @@ impl Ctx {
         ctx.socket.send_to(&syn, remote).await?;
         info!("Sent SYN (conn={})", conn_id);
 
-        let (hdr, _) = ctx.recv_parsed(Duration::from_secs(3)).await?;
+        let (hdr, _) = ctx.recv_parsed(Duration::from_secs(5)).await?;
         if hdr.pkt_type != PacketType::SynAck || hdr.conn_id != conn_id {
             anyhow::bail!("Expected SYN-ACK");
         }
@@ -342,7 +349,7 @@ impl Ctx {
         });
         ctx.socket.send_to(&hello, remote).await?;
 
-        if let Some(msg) = ctx.recv_control(Duration::from_secs(3)).await? {
+        if let Some(msg) = ctx.recv_control(Duration::from_secs(5)).await? {
             if let ControlMsg::HelloAck { version: v, capabilities: caps } = msg {
                 info!("HelloAck v={} caps={:?}", v, caps);
             }
@@ -717,7 +724,7 @@ async fn main() -> anyhow::Result<()> {
                 DockerAction::Ps { all, .. } => DockerActionType::Ps { all: all, running: false },
                 DockerAction::Logs { name, tail, follow } => DockerActionType::Logs { name: name.clone(), tail: tail, follow: follow },
                 DockerAction::Stats { .. } => DockerActionType::Stats { interval_secs: 0 },
-                DockerAction::Exec { container, cmd } => DockerActionType::Exec { container: container.clone(), cmd: cmd.clone() },
+                DockerAction::Exec { container, interactive, cmd } => DockerActionType::Exec { container: container.clone(), interactive, cmd: cmd.clone() },
                 DockerAction::Info => DockerActionType::Info,
                 DockerAction::Images => DockerActionType::Images,
                 DockerAction::Rm { container, force } => DockerActionType::Rm { container: container.clone(), force: force },

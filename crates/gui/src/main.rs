@@ -56,6 +56,7 @@ struct LanLinkApp {
     tab_candidates: Vec<String>,
     tab_filter: String,
     history_idx: Option<usize>,
+    theme_applied: bool,
 }
 
 #[derive(Clone)]
@@ -94,6 +95,7 @@ impl LanLinkApp {
             tab_candidates: Vec::new(),
             tab_filter: String::new(),
             history_idx: None,
+            theme_applied: false,
         }
     }
 
@@ -159,23 +161,55 @@ impl LanLinkApp {
         let events: Arc<std::sync::Mutex<Vec<ExecEvent>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
         self.pending_events.lock().unwrap().clear();
         let events_w = events.clone();
+        let events_w2 = events.clone();
         let runtime = self.runtime.clone();
         std::thread::spawn(move || {
-            runtime.block_on(async move {
-                let mut guard = conn.lock().await;
-                let events_w_err = events_w.clone();
-                let on_event = move |ev: ExecEvent| {
-                    events_w.lock().unwrap().push(ev);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                runtime.block_on(async move {
+                    // Lock only to clone connection internals, then drop lock immediately
+                    let (socket, psk, conn_id, peer, seq, next_id) = {
+                        let guard = conn.lock().await;
+                        (guard.socket.clone(), guard.psk, guard.conn_id, guard.peer, guard.seq.clone(), guard.next_id.clone())
+                    };
+                    drop(conn); // release the Arc, no more locking
+
+                    let events_w_err = events_w.clone();
+                    let on_event = {
+                        let events_w = events_w.clone();
+                        move |ev: ExecEvent| {
+                            events_w.lock().unwrap().push(ev);
+                        }
+                    };
+
+                    // Rebuild a temporary connection context for exec_streaming
+                    let mut temp_conn = client::Connection {
+                        socket, psk, conn_id, peer,
+                        seq, next_id,
+                    };
+                    let res = temp_conn.exec_streaming(&cmd, None, 60, on_event).await;
+                    if let Err(e) = res {
+                        events_w_err.lock().unwrap().push(ExecEvent::Chunk(client::ExecOutput {
+                            stream: 1,
+                            data: format!("\n[错误] {}\n", e).into_bytes(),
+                        }));
+                        events_w_err.lock().unwrap().push(ExecEvent::Done(None));
+                    }
+                });
+            }));
+            if let Err(e) = result {
+                let msg = if let Some(s) = e.downcast_ref::<&str>() {
+                    s.to_string()
+                } else if let Some(s) = e.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "unknown panic".to_string()
                 };
-                let res = guard.exec_streaming(&cmd, None, 60, on_event).await;
-                if let Err(e) = res {
-                    events_w_err.lock().unwrap().push(ExecEvent::Chunk(client::ExecOutput {
-                        stream: 1,
-                        data: format!("\n[错误] {}\n", e).into_bytes(),
-                    }));
-                    events_w_err.lock().unwrap().push(ExecEvent::Done(None));
-                }
-            });
+                events_w2.lock().unwrap().push(ExecEvent::Chunk(client::ExecOutput {
+                    stream: 1,
+                    data: format!("\n[panic] {}\n", msg).into_bytes(),
+                }));
+                events_w2.lock().unwrap().push(ExecEvent::Done(None));
+            }
         });
         *self.pending_events.lock().unwrap() = (*events.lock().unwrap()).clone();
     }
@@ -220,7 +254,8 @@ impl LanLinkApp {
         }
     }
 
-    fn apply_theme(&self, ctx: &egui::Context) {
+    fn apply_theme(&mut self, ctx: &egui::Context) {
+        if self.theme_applied { return; }
         let mut style = egui::Style::default();
         // Dark theme with soft colors
         style.visuals = egui::Visuals::dark();
@@ -240,6 +275,7 @@ impl LanLinkApp {
         style.visuals.window_corner_radius = egui::CornerRadius::same(8u8);
         style.visuals.window_shadow = egui::Shadow::NONE;
         ctx.set_style(style);
+        self.theme_applied = true;
     }
 }
 

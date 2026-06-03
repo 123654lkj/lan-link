@@ -85,6 +85,9 @@ pub fn cmd_portscan(host: &str, start: u16, end: u16) -> (Vec<u8>, Option<i32>) 
     });
 
     out += &results.into_inner().unwrap();
+    if out == format!("Scanning ports {}-{} on {}\n", start, end, host) {
+        out += "No open ports found or host unreachable\n";
+    }
     (out.into_bytes(), Some(0))
 }
 

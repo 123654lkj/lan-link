@@ -361,24 +361,38 @@ pub fn cmd_top_snapshot() -> (Vec<u8>, Option<i32>) {
 
     ps.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-    for (pid, _, vsz, rss) in ps.iter().take(20) {
+    // Read uptime for %CPU calculation
+    let uptime_secs = read_proc("/proc/uptime")
+        .split_whitespace()
+        .next()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(1.0);
+    let clk_tck = 100.0; // sysconf(_SC_CLK_TCK) typically 100
+    let total_mem_kb = kv("MemTotal:");
+
+    for (pid, cpu_jiffies, vsz, rss) in ps.iter().take(20) {
         let cl = read_proc(&format!("/proc/{}/cmdline", pid));
 
         let cmd = if cl.is_empty() {
             format!("[{}]", pid)
         } else {
             cl.replace('\0', " ")
-                .split_whitespace()
-                .next()
-                .unwrap_or("?")
-                .to_string()
+        };
+
+        let cpu_pct = cpu_jiffies / (uptime_secs * clk_tck) * 100.0;
+        let mem_pct = if total_mem_kb > 0 {
+            (*rss as f64) / (total_mem_kb as f64 * 1024.0) * 100.0
+        } else {
+            0.0
         };
 
         out += &format!(
-            "{:>5} ?        20   0 {:>7} {:>7} ?    S   0.0  0.0   0:00.00 {}\n",
+            "{:>5} ?        20   0 {:>7} {:>7} ?    S {:>5.1} {:>5.1}   0:00.00 {}\n",
             pid,
             vsz / 1024,
             rss / 1024,
+            cpu_pct.min(99.9),
+            mem_pct.min(99.9),
             cmd
         );
     }

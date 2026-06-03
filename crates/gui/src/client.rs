@@ -140,7 +140,7 @@ impl Connection {
         // Wait SYN-ACK
         let mut buf = vec![0u8; 2048];
         let mut got_syn_ack = false;
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
             let remain = deadline.saturating_duration_since(Instant::now());
             match timeout(remain, socket.recv(&mut buf)).await {

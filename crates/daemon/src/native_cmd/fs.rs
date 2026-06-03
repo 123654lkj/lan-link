@@ -242,7 +242,7 @@ pub fn cmd_grep(
     )
 }
 
-pub fn grep_walk(p: &std::path::Path, pat: &str, out: &mut String, t: &mut usize, _ln: bool, cnt: bool) {
+pub fn grep_walk(p: &std::path::Path, pat: &str, out: &mut String, t: &mut usize, ln: bool, cnt: bool) {
     let mut stack = vec![p.to_path_buf()];
     while let Some(dir) = stack.pop() {
         if let Ok(entries) = std::fs::read_dir(&dir) {
@@ -256,8 +256,11 @@ pub fn grep_walk(p: &std::path::Path, pat: &str, out: &mut String, t: &mut usize
                         if l.contains(pat) {
                             fm += 1;
                             if !cnt {
-                                // 递归模式统一输出 文件名:行号:内容
-                                out.push_str(&format!("{}:{}:{}\n", path.display(), i + 1, l));
+                                if ln {
+                                    out.push_str(&format!("{}:{}:{}\n", path.display(), i + 1, l));
+                                } else {
+                                    out.push_str(&format!("{}:{}\n", path.display(), l));
+                                }
                             }
                         }
                     }

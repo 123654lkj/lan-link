@@ -217,16 +217,37 @@ pub fn cmd_journal(
     unit: Option<&str>,
     lines: u32,
     priority: Option<&str>,
-    _since: Option<&str>,
-    _follow: bool,
+    since: Option<&str>,
+    follow: bool,
 ) -> (Vec<u8>, Option<i32>) {
     let mut out = String::new();
     for path in &["/var/log/syslog", "/var/log/messages"] {
         if let Ok(content) = std::fs::read_to_string(path) {
-            for line in content.lines() {
+            let iter: Box<dyn Iterator<Item = String>> = if follow && lines > 0 {
+                // --follow with --lines: tail last N lines
+                let lv: Vec<&str> = content.lines().collect();
+                let skip = lv.len().saturating_sub(lines as usize);
+                Box::new(lv.into_iter().skip(skip).map(|s| s.to_string()))
+            } else {
+                Box::new(content.lines().map(|s| s.to_string()))
+            };
+
+            for line in iter {
                 if let Some(u) = unit {
                     if !line.contains(u.trim_end_matches(".service")) {
                         continue;
+                    }
+                }
+                if let Some(s) = since {
+                    // Simple date comparison: assume log lines start with "Jan  1" or "2024-01-01" format
+                    // If the line doesn't contain the since string as a prefix, skip it
+                    if !line.starts_with(s) && !line.contains(s) {
+                        // Try to compare dates: since format is "YYYY-MM-DD" or "Mon DD"
+                        // If the line doesn't mention the date at all, skip
+                        let since_clean = s.trim();
+                        if !line.contains(since_clean) {
+                            continue;
+                        }
                     }
                 }
                 if let Some(mp) = priority.and_then(|p| match p {
@@ -251,15 +272,35 @@ pub fn cmd_journal(
                         continue;
                     }
                 }
-                out.push_str(line);
+                out.push_str(&line);
                 out.push('\n');
             }
         }
     }
-    if lines > 0 {
+    if lines > 0 && !follow {
         let lv: Vec<&str> = out.lines().collect();
         if lv.len() > lines as usize {
             out = lv[lv.len() - lines as usize..].join("\n") + "\n";
+        }
+    }
+    // If --follow was requested, do a simple polling loop
+    if follow {
+        for path in &["/var/log/syslog", "/var/log/messages"] {
+            if let Ok(content) = std::fs::read_to_string(path) {
+                out.push_str(&format!("\n--- following {} (press Ctrl+C to stop) ---\n", path));
+                // Read initial size
+                let mut last_size = content.len();
+                for _ in 0..5 { // poll up to 5 times
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    if let Ok(updated) = std::fs::read_to_string(path) {
+                        if updated.len() > last_size {
+                            out.push_str(&updated[last_size..]);
+                            last_size = updated.len();
+                        }
+                    }
+                }
+                break;
+            }
         }
     }
     if out.is_empty() {
@@ -474,8 +515,8 @@ pub fn cmd_docker(action: &lan_link_protocol::frame::DockerActionType) -> (Vec<u
             None,
         ),
         DockerActionType::Stats { .. } => docker_api("GET", "/containers/json?all=true", None),
-        DockerActionType::Exec { container, cmd } => {
-            let body = format!(r#"{{\"AttachStdin\":false,\"AttachStdout\":true,\"AttachStderr\":true,\"Cmd\":{:?}}}"#, cmd).to_string();
+        DockerActionType::Exec { container, cmd, interactive } => {
+            let body = format!(r#"{{\"AttachStdin\":{att},\"AttachStdout\":true,\"AttachStderr\":true,\"Cmd\":{:?}}}"#, cmd, att = if *interactive { "true" } else { "false" }).to_string();
             let (cr, _) = docker_api(
                 "POST",
                 &format!("/containers/{}/exec", container),
@@ -485,10 +526,11 @@ pub fn cmd_docker(action: &lan_link_protocol::frame::DockerActionType) -> (Vec<u
             if let Some(is) = s.find("\"Id\":\"") {
                 let id_str = &s[is + 6..];
                 if let Some(ie) = id_str.find('\"') {
+                    let start_body = format!("{{\"Detach\":false,\"Tty\":{}}}", if *interactive { "true" } else { "false" });
                     return docker_api(
                         "POST",
                         &format!("/exec/{}/start", &id_str[..ie]),
-                        Some("{\"Detach\":false,\"Tty\":false}"),
+                        Some(&start_body),
                     );
                 }
             }

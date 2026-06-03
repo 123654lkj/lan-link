@@ -1,7 +1,7 @@
 """Test: send a cat-like command (no args -> reads stdin until EOF),
 write to stdin, close, verify chunks and Done."""
-import sys, time, struct
-sys.path.insert(0, r"G:\codex-AI-tools\lan-link")
+import sys, os, time, struct
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from client_win import (
     Config, Log, LanLinkClient, parse_header, decrypt, HEADER_SIZE,
     control_hello, control_exec, control_exec_stdin,

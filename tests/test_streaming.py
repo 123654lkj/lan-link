@@ -4,7 +4,7 @@
 Run from Windows after the daemon is running on the remote box.
 """
 import sys, os, time, struct
-sys.path.insert(0, r"G:\codex-AI-tools\lan-link")
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from client_win import (
     Config, Log, LanLinkClient, make_nonce, encrypt, decrypt,
     build_packet, parse_header, HEADER_SIZE, MAX_PAYLOAD,

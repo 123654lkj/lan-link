@@ -355,7 +355,7 @@ impl InputInjector for LinuxInputInjector {
                     total += write_input_event(fd, 2, 8, *delta as i32);
                 }
             }
-            total += write_input_event(fd, 0, 0, 0); // EV_SYN
+            total += write_input_event(fd, 0x11, 0, 0); // EV_SYN
         }
         total
     }

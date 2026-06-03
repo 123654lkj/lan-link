@@ -141,7 +141,6 @@ impl PacketHeader {
 pub enum ControlMsg {
     /// Shell: execute command, return output (legacy one-shot)
     Exec { id: u32, cmd: String },
-    ExecOutput { id: u32, data: Vec<u8>, exit_code: Option<i32> },
 
 
     /// File transfer
@@ -287,7 +286,7 @@ pub enum DockerActionType {
     Ps { all: bool, running: bool },
     Logs { name: String, tail: u32, follow: bool },
     Stats { interval_secs: u64 },
-    Exec { container: String, cmd: Vec<String> },
+    Exec { container: String, cmd: Vec<String>, interactive: bool },
     Info,
     Images,
     Rm { container: String, force: bool },
