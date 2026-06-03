@@ -146,8 +146,7 @@ pub fn cmd_whoami() -> (Vec<u8>, Option<i32>) {
 
 pub fn cmd_ps(full: bool, user: Option<String>, tree: bool) -> (Vec<u8>, Option<i32>) {
     if tree {
-        let t = cmd_top_snapshot();
-        return (t.into_bytes(), Some(0));
+        return cmd_top_snapshot();
     }
 
     let dir = match std::fs::read_dir("/proc") {
@@ -260,7 +259,7 @@ pub fn cmd_info() -> (Vec<u8>, Option<i32>) {
     (out.into_bytes(), Some(0))
 }
 
-pub fn cmd_top_snapshot() -> String {
+pub fn cmd_top_snapshot() -> (Vec<u8>, Option<i32>) {
     let mut out = String::from("top - native\n\n");
 
     let load = read_proc("/proc/loadavg");
@@ -373,7 +372,7 @@ pub fn cmd_top_snapshot() -> String {
         );
     }
 
-    out
+    (out.into_bytes(), Some(0))
 }
 
 pub fn cmd_kill(pid: u32, signal: u32) -> (Vec<u8>, Option<i32>) {

@@ -51,7 +51,7 @@ pub fn run_native_cmd(cmd: &NativeCmdType) -> (Vec<u8>, Option<i32>) {
         NativeCmdType::Whoami => system::cmd_whoami(),
         NativeCmdType::Ps { full, user, tree } => system::cmd_ps(*full, user.clone(), *tree),
         NativeCmdType::Info => system::cmd_info(),
-        NativeCmdType::Top { .. } => (system::cmd_top_snapshot().into_bytes(), Some(0)),
+        NativeCmdType::Top { .. } => system::cmd_top_snapshot(),
         NativeCmdType::Kill { pid, signal } => system::cmd_kill(*pid, *signal),
         NativeCmdType::Pgrep { name, full, count } => system::cmd_pgrep(name, *full, *count),
         NativeCmdType::Dmesg { lines, .. } => system::cmd_dmesg(*lines),
