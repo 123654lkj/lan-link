@@ -424,18 +424,31 @@ pub fn cmd_last(lines: u32) -> (Vec<u8>, Option<i32>) {
     }
 }
 
-pub fn cmd_dmesg(_lines: u32) -> (Vec<u8>, Option<i32>) {
+pub fn cmd_dmesg(lines: u32) -> (Vec<u8>, Option<i32>) {
     let mut text = String::new();
     if let Ok(mut f) = std::fs::File::open("/dev/kmsg") {
         use std::io::Read;
-        let mut buf = [0u8; 8192];
-        for _ in 0..128 {
-            match f.read(&mut buf) {
-                Ok(n) if n > 0 => {
-                    text.push_str(&String::from_utf8_lossy(&buf[..n]));
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 8192];
+            let mut total = 0usize;
+            let mut local = String::new();
+            loop {
+                match f.read(&mut buf) {
+                    Ok(n) if n > 0 => {
+                        total += n;
+                        local.push_str(&String::from_utf8_lossy(&buf[..n]));
+                        if total >= 65536 {
+                            break; // 64KB cap
+                        }
+                    }
+                    _ => break,
                 }
-                _ => break,
             }
+            let _ = tx.send(local);
+        });
+        if let Ok(s) = rx.recv_timeout(std::time::Duration::from_secs(2)) {
+            text = s;
         }
     }
     if text.is_empty() {
@@ -455,10 +468,10 @@ pub fn cmd_dmesg(_lines: u32) -> (Vec<u8>, Option<i32>) {
             text = krn;
         }
     }
-    if _lines > 0 {
+    if lines > 0 {
         let lv: Vec<&str> = text.lines().collect();
-        if lv.len() > _lines as usize {
-            text = lv[lv.len() - _lines as usize..].join("\n") + "\n";
+        if lv.len() > lines as usize {
+            text = lv[lv.len() - lines as usize..].join("\n") + "\n";
         }
     }
     if text.is_empty() {
