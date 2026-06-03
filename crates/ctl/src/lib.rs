@@ -1,14 +1,15 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+//! lan-linkctl — 局域网远程管理 CLI 客户端库
+//!
+//! 提供命令行客户端连接和管理远程 daemon 的核心逻辑。
+//!
+//! # 功能
+//!
+//! - **连接管理** — UDP 握手、加密通信、心跳保活
+//! - **命令执行** — 发送 NativeCmd 和 Exec 命令到远程 daemon
+//! - **文件传输** — 文件推送和拉取
+//! - **输入注入** — 键盘/鼠标事件远程注入
+//!
+//! # 子命令
+//!
+//! 通过 `clap` 定义 50+ 子命令，覆盖文件操作、系统管理、网络诊断等场景。
+//! 每个子命令映射到对应的 `NativeCmdType` 变体，通过加密 UDP 通道发送给 daemon。
