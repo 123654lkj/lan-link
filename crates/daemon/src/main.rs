@@ -49,6 +49,66 @@ const PSK_PATH: &str = "/etc/lan-link/psk";
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 const TIMEOUT: Duration = Duration::from_secs(30);
 
+// ── 速率限制常量 ──────────────────────────────────────────────
+/// 每个源 IP 每 60 秒最多允许的 SYN 握手次数
+const SYN_RATE_LIMIT: u32 = 5;
+/// 每个源 IP 每 60 秒最多允许的控制命令数（解密成功后计数）
+const CMD_RATE_LIMIT: u32 = 30;
+/// 速率限制窗口（秒）
+const RATE_WINDOW_SECS: u64 = 60;
+/// 单个 daemon 最大并发连接数（防连接耗尽）
+const MAX_CONNECTIONS: usize = 100;
+
+// ── 速率限制器 ──────────────────────────────────────────────
+/// 简单的滑动窗口速率限制器，按源 IP 分桶。
+/// 不引入外部依赖，仅用 HashMap + Instant。
+struct RateLimiter {
+    /// (ip, window_start) → count
+    syn_counts: HashMap<std::net::IpAddr, (Instant, u32)>,
+    cmd_counts: HashMap<std::net::IpAddr, (Instant, u32)>,
+}
+
+impl RateLimiter {
+    fn new() -> Self {
+        Self {
+            syn_counts: HashMap::new(),
+            cmd_counts: HashMap::new(),
+        }
+    }
+
+    /// 检查并消耗一个 SYN 配额。返回 true 表示允许，false 表示限速。
+    fn check_syn(&mut self, ip: std::net::IpAddr) -> bool {
+        let now = Instant::now();
+        let entry = self.syn_counts.entry(ip).or_insert((now, 0));
+        if now.duration_since(entry.0) > Duration::from_secs(RATE_WINDOW_SECS) {
+            *entry = (now, 1);
+            return true;
+        }
+        entry.1 += 1;
+        entry.1 <= SYN_RATE_LIMIT
+    }
+
+    /// 检查并消耗一个命令配额。返回 true 表示允许，false 表示限速。
+    fn check_cmd(&mut self, ip: std::net::IpAddr) -> bool {
+        let now = Instant::now();
+        let entry = self.cmd_counts.entry(ip).or_insert((now, 0));
+        if now.duration_since(entry.0) > Duration::from_secs(RATE_WINDOW_SECS) {
+            *entry = (now, 1);
+            return true;
+        }
+        entry.1 += 1;
+        entry.1 <= CMD_RATE_LIMIT
+    }
+
+    /// 定期清理过期条目，防止内存无限增长（每 heartbeat tick 调用）。
+    fn gc(&mut self) {
+        let now = Instant::now();
+        let window = Duration::from_secs(RATE_WINDOW_SECS * 2);
+        self.syn_counts.retain(|_, v| now.duration_since(v.0) < window);
+        self.cmd_counts.retain(|_, v| now.duration_since(v.0) < window);
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "lan-linkd", version, about = "LAN link 远程管理服务端")]
 struct Args {
@@ -106,13 +166,14 @@ async fn main() -> anyhow::Result<()> {
     let mut buf = vec![0u8; lan_link_protocol::frame::MAX_PACKET];
     let exec_map: ExecMap = new_exec_map();
     let mut last_hb = Instant::now();
+    let mut rate_limiter = RateLimiter::new();
 
 
     loop {
         match tokio::time::timeout(Duration::from_millis(100), socket.recv_from(&mut buf)).await {
             Ok(Ok((n, peer))) => {
                 debug!("recv {} bytes from {}", n, peer);
-                handle_packet_inner(&mut buf[..n], peer, &mut connections, &psk, &exec_map, send_socket.clone()).await;
+                handle_packet_inner(&mut buf[..n], peer, &mut connections, &psk, &exec_map, send_socket.clone(), &mut rate_limiter).await;
             }
             Ok(Err(e)) => warn!("recv error: {}", e),
             Err(_) => {}
@@ -122,6 +183,7 @@ async fn main() -> anyhow::Result<()> {
         if now.duration_since(last_hb) >= HEARTBEAT_INTERVAL {
             last_hb = now;
             debug!("hb tick: {} conns", connections.len());
+            rate_limiter.gc();
             for conn in connections.values() {
                 if conn.state == ConnState::Established {
                     let hb = Connection::build_heartbeat(conn.id);
@@ -139,7 +201,7 @@ async fn main() -> anyhow::Result<()> {
 
 async fn handle_packet_inner(
     data: &mut [u8], peer: SocketAddr, connections: &mut HashMap<u64, Connection>, psk: &Psk, exec_map: &ExecMap,
-    send_socket: Arc<UdpSocket>) {
+    send_socket: Arc<UdpSocket>, rate_limiter: &mut RateLimiter) {
     let mut cursor = std::io::Cursor::new(&*data);
     let header = match PacketHeader::decode(&mut cursor) {
         Some(h) => h, None => { warn!("Bad header from {}", peer); return; }
@@ -148,6 +210,16 @@ async fn handle_packet_inner(
 
     match header.pkt_type {
         PacketType::Syn => {
+            // ── 速率限制：SYN ──
+            if !rate_limiter.check_syn(peer.ip()) {
+                warn!("SYN rate limit exceeded from {}, dropping", peer);
+                return;
+            }
+            // ── 连接数限制 ──
+            if connections.len() >= MAX_CONNECTIONS {
+                warn!("MAX_CONNECTIONS ({}) reached, rejecting SYN from {}", MAX_CONNECTIONS, peer);
+                return;
+            }
             info!("SYN from {} (conn={})", peer, conn_id);
             let conn = Connection::new(conn_id, peer);
             let syn_ack = Connection::build_syn_ack(conn_id);
@@ -173,6 +245,11 @@ async fn handle_packet_inner(
             }
             let stream_id = header.stream_id;
             if stream_id == StreamId::Control as u16 {
+                // ── 速率限制：控制命令 ──
+                if !rate_limiter.check_cmd(peer.ip()) {
+                    warn!("CMD rate limit exceeded from {}, dropping control msg", peer);
+                    return;
+                }
                 let ctrl_seq = connections.get(&conn_id).map(|c| Arc::clone(&c.send_seq));
                 if let Some(seq) = ctrl_seq {
                     handle_control(&plaintext, conn_id, peer, psk, &exec_map, send_socket.clone(), seq).await;
