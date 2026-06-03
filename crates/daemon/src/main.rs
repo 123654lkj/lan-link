@@ -159,7 +159,7 @@ async fn handle_packet_inner(
             }
             let stream_id = header.stream_id;
             if stream_id == StreamId::Control as u16 {
-                handle_control(&plaintext, conn_id, peer, connections, psk, &exec_map, send_socket.clone()).await;
+                handle_control(&plaintext, conn_id, peer, psk, &exec_map, send_socket.clone()).await;
             } else if stream_id == StreamId::Input as u16 {
                 #[cfg(target_os = "linux")]
                 handle_input_linux(&plaintext, peer);
@@ -219,7 +219,7 @@ fn handle_input_linux(data: &[u8], peer: SocketAddr) {
 
 async fn handle_control(
     data: &[u8], conn_id: u64, peer: SocketAddr,
-    _connections: &mut HashMap<u64, Connection>, psk: &Psk, exec_map: &ExecMap,
+    psk: &Psk, exec_map: &ExecMap,
     send_socket: Arc<UdpSocket>,
 ) {
     let msg: ControlMsg = match bincode::deserialize(data) {
