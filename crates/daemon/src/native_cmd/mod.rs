@@ -37,7 +37,7 @@ pub fn run_native_cmd(cmd: &NativeCmdType) -> (Vec<u8>, Option<i32>) {
         NativeCmdType::Tail { path, lines, follow, follow_secs } => fs::cmd_tail(path, *lines, *follow, *follow_secs),
         NativeCmdType::Stat { path } => fs::cmd_stat(path),
         NativeCmdType::Grep { pattern, path, recursive, line_number, count } => {
-            fs::cmd_grep(pattern, path, *recursive, *line_number, *count)
+            fs::cmd_grep(pattern, path, *recursive, *line_number, *count, 10)
         }
         NativeCmdType::Find { path, name, type_, maxdepth } => {
             fs::cmd_find(path, &name, &type_, *maxdepth)

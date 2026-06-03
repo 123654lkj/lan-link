@@ -172,9 +172,9 @@ impl Connection {
 
     pub async fn send_control(&mut self, msg: &ControlMsg) -> anyhow::Result<()> {
         let payload = serialize(msg)?;
-        let seq = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
+        let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
         let nonce = crypto::make_nonce(self.conn_id, seq);
-        let ciphertext = crypto::encrypt(&self.psk, &nonce, &payload);
+        let ciphertext = crypto::encrypt(&self.psk, &nonce, &payload).map_err(|e| anyhow::anyhow!("encrypt: {}", e))?;
         let pkt = build_encrypted(self.conn_id, STREAM_CONTROL, seq, &nonce, &ciphertext);
         self.socket.send(&pkt).await?;
         Ok(())
@@ -191,7 +191,7 @@ impl Connection {
         timeout_secs: u64,
         mut on_event: impl FnMut(ExecEvent) + Send + 'static,
     ) -> anyhow::Result<Option<i32>> {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         self.send_control(&ControlMsg::Exec { id, cmd: cmd.to_string() }).await?;
         if let Some(data) = stdin_bytes {
             self.send_control(&ControlMsg::ExecStdin { id, data, close: true }).await?;

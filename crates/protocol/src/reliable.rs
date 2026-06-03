@@ -72,7 +72,7 @@ impl ReliableSender {
             if dist == 0 {
                 slot.acked = true;
                 acked.push(slot.seq);
-            } else if dist <= WINDOW_SIZE && (ack_bitmap & (1 << (dist - 1))) != 0 {
+            } else if dist <= WINDOW_SIZE && (ack_bitmap & (1u32.checked_shl(dist - 1).unwrap_or(0))) != 0 {
                 slot.acked = true;
                 acked.push(slot.seq);
             }
@@ -184,6 +184,7 @@ impl ReliableReceiver {
             vec![]
         } else {
             // Outside window, discard
+            tracing::warn!("deliver: seq {} outside window (next_expected={}), dropping", seq, self.next_expected);
             vec![]
         }
     }

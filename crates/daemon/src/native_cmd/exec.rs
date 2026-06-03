@@ -44,6 +44,12 @@ pub fn cmd_sed(path: &str, pattern: &str, replacement: &str) -> (Vec<u8>, Option
         return (b"sed: path must not contain '..'\n".to_vec(), Some(1));
     }
 
+    // NOTE: TOCTOU race — the file is read and then written in two separate
+    // operations. A concurrent writer could modify the file between the read
+    // and the write, causing data loss or inconsistency. A production fix would
+    // use a rename+atomic-write pattern: write to a temp file, then rename over
+    // the original.
+
     let new_content = match std::fs::read_to_string(path) {
         Ok(c) => c.replace(pattern, replacement),
         Err(e) => return (format!("read error: {}\n", e).into_bytes(), Some(1)),

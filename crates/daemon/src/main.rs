@@ -247,9 +247,13 @@ async fn handle_packet_inner(
             }
         }
         PacketType::Data => {
-            // Only process Data on established connections
+            // Verify source IP matches connection
             match connections.get(&conn_id) {
-                Some(conn) if conn.state == ConnState::Established => {}
+                Some(conn) if conn.state == ConnState::Established && conn.peer == peer => {}
+                Some(conn) if conn.state == ConnState::Established && conn.peer != peer => {
+                    warn!("Data from wrong peer {} for conn {} (expected {}), dropping", peer, conn_id, conn.peer);
+                    return;
+                }
                 _ => { warn!("Data on non-established conn {} from {}", conn_id, peer); return; }
             }
             let enc_start = HEADER_SIZE;
@@ -281,7 +285,7 @@ async fn handle_packet_inner(
         }
         PacketType::Heartbeat => {
             if let Some(conn) = connections.get_mut(&conn_id) {
-                if conn.state != ConnState::Established {
+                if conn.state != ConnState::Established || conn.peer != peer {
                     return;
                 }
                 conn.last_activity = Instant::now();
@@ -413,9 +417,15 @@ async fn handle_control(
             let _ = send_control(conn_id, peer, psk, next_seq(), &ControlMsg::HelloAck { version: PROTOCOL_VERSION, capabilities: vec!["exec".into(), "input".into()] }, &send_socket).await;
         }
         ControlMsg::NativeCmd { id, cmd } => {
-            let (out, exit) = native_cmd::run_native_cmd(&cmd);
-            let _ = send_control(conn_id, peer, psk, next_seq(), &ControlMsg::ExecChunk { id, stream: 0, data: out }, &send_socket).await;
-            let _ = send_control(conn_id, peer, psk, next_seq(), &ControlMsg::ExecDone { id, exit_code: exit }, &send_socket).await;
+            let psk2 = *psk;
+            let sock2 = send_socket.clone();
+            let peer2 = peer;
+            // Run in blocking thread to not stall the async event loop
+            let (out, exit) = tokio::task::spawn_blocking(move || {
+                native_cmd::run_native_cmd(&cmd)
+            }).await.unwrap_or((b"NativeCmd: spawn_blocking failed\n".to_vec(), Some(1)));
+            let _ = send_control(conn_id, peer2, &psk2, next_seq(), &ControlMsg::ExecChunk { id, stream: 0, data: out }, &sock2).await;
+            let _ = send_control(conn_id, peer2, &psk2, next_seq(), &ControlMsg::ExecDone { id, exit_code: exit }, &sock2).await;
         }
 
         _ => debug!("Unhandled control: {:?}", msg),
@@ -490,7 +500,10 @@ async fn send_control(conn_id: u64, peer: SocketAddr, psk: &Psk, seq: u64, msg: 
     let payload = bincode::serialize(msg).unwrap();
     let seq32 = seq as u32;
     let nonce = crypto::make_nonce(conn_id, seq32);
-    let encrypted = crypto::encrypt(psk, &nonce, &payload);
+    let encrypted = match crypto::encrypt(psk, &nonce, &payload) {
+        Ok(e) => e,
+        Err(_) => { warn!("encrypt failed for conn {}", conn_id); return; }
+    };
     let packet = Connection::build_encrypted_data(conn_id, StreamId::Control as u16, seq32, Flags::RELIABLE, &encrypted, nonce);
     let _ = send_socket.send_to(&packet, peer).await;
 }

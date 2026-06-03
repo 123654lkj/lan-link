@@ -379,7 +379,19 @@ pub fn cmd_top_snapshot() -> (Vec<u8>, Option<i32>) {
             cl.replace('\0', " ")
         };
 
-        let cpu_pct = cpu_jiffies / (uptime_secs * clk_tck) * 100.0;
+        // Read starttime from /proc/[pid]/stat (field 21, 0-indexed)
+        let proc_stat = read_proc(&format!("/proc/{}/stat", pid));
+        let starttime: f64 = proc_stat
+            .split_whitespace()
+            .nth(21)
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.0);
+        let proc_uptime = uptime_secs - starttime / clk_tck;
+        let cpu_pct = if proc_uptime > 0.0 {
+            cpu_jiffies / proc_uptime / clk_tck * 100.0
+        } else {
+            0.0
+        };
         let mem_pct = if total_mem_kb > 0 {
             (*rss as f64) / (total_mem_kb as f64 * 1024.0) * 100.0
         } else {

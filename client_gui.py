@@ -606,7 +606,9 @@ class App(tk.Tk):
             try:
                 self.gui_client.connect()
             except Exception:
-                pass
+                import traceback
+                tb = traceback.format_exc()
+                messagebox.showerror("连接失败", f"无法连接到 {host['name']} ({host['addr']})\n\n{tb}")
         self._update_status()
 
     def _update_status(self):

@@ -118,7 +118,8 @@ pub fn cmd_tail(path: &str, n: u32, follow: bool, follow_secs: u64) -> (Vec<u8>,
     if follow {
         let secs = if follow_secs > 0 { follow_secs } else { 1 };
         let mut known_count = lines.len();
-        loop {
+        let max_iter = if follow_secs > 0 { follow_secs / secs } else { 60 };
+        for _ in 0..max_iter {
             std::thread::sleep(std::time::Duration::from_secs(secs));
             if let Ok(new_c) = std::fs::read_to_string(path) {
                 let new_lines: Vec<&str> = new_c.lines().collect();
@@ -187,6 +188,7 @@ pub fn cmd_grep(
     recursive: bool,
     ln: bool,
     cnt: bool,
+    maxdepth: u32,
 ) -> (Vec<u8>, Option<i32>) {
     if !recursive {
         let c = match std::fs::read_to_string(path) {
@@ -230,6 +232,7 @@ pub fn cmd_grep(
         &mut total,
         ln,
         cnt,
+        maxdepth,
     );
 
     (
@@ -242,14 +245,17 @@ pub fn cmd_grep(
     )
 }
 
-pub fn grep_walk(p: &std::path::Path, pat: &str, out: &mut String, t: &mut usize, ln: bool, cnt: bool) {
-    let mut stack = vec![p.to_path_buf()];
-    while let Some(dir) = stack.pop() {
+pub fn grep_walk(p: &std::path::Path, pat: &str, out: &mut String, t: &mut usize, ln: bool, cnt: bool, max_depth: u32) {
+    let mut stack = vec![(p.to_path_buf(), 0u32)];
+    while let Some((dir, depth)) = stack.pop() {
+        if depth >= max_depth {
+            continue;
+        }
         if let Ok(entries) = std::fs::read_dir(&dir) {
             for entry in entries.filter_map(|e| e.ok()) {
                 let path = entry.path();
                 if path.is_dir() {
-                    stack.push(path);
+                    stack.push((path, depth + 1));
                 } else if let Ok(c) = std::fs::read_to_string(&path) {
                     let mut fm = 0usize;
                     for (i, l) in c.lines().enumerate() {

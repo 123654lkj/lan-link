@@ -201,16 +201,16 @@ def input_key(down, scancode, vk, modifiers=0):
 
 def input_mouse_move(dx, dy):
     # enum tag u32 + struct { i32 dx, i32 dy, bool absolute }
-    return struct.pack("<I", MOUSE_EV_MOVE) + struct.pack("<iiB", dx, dy, 0) + b"\x00\x00\x00"  # 4B padding to align to 4
+    return struct.pack("<I", MOUSE_EV_MOVE) + struct.pack("<iiB", dx, dy, 0)
 
 
 def input_mouse_button(button, down):
-    # enum tag u32 + struct { MouseButton(u8), bool(u8) } + padding
-    return struct.pack("<I", MOUSE_EV_BUTTON) + struct.pack("<BB", button, 1 if down else 0) + b"\x00\x00"
+    # enum tag u32 + MouseButton enum tag u32 + bool down (1B)
+    return struct.pack("<IIB", MOUSE_EV_BUTTON, button, 1 if down else 0)
 
 
 def input_mouse_wheel(delta, horizontal=False):
-    return struct.pack("<I", MOUSE_EV_WHEEL) + struct.pack("<hB", delta, 1 if horizontal else 0) + b"\x00"
+    return struct.pack("<I", MOUSE_EV_WHEEL) + struct.pack("<hB", delta, 1 if horizontal else 0)
 
 
 class LanLinkClient:

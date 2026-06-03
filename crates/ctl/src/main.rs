@@ -298,7 +298,7 @@ enum MouseAction {
 fn encode_control(conn_id: u64, psk: &Psk, seq: u32, msg: &ControlMsg) -> Vec<u8> {
     let payload = bincode::serialize(msg).expect("serialize");
     let nonce = crypto::make_nonce(conn_id, seq);
-    let encrypted = crypto::encrypt(psk, &nonce, &payload);
+    let encrypted = crypto::encrypt(psk, &nonce, &payload).expect("encrypt");
     encode_packet(conn_id, PacketType::Data, StreamId::Control as u16, seq, Flags::RELIABLE, &encrypted)
 }
 

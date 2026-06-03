@@ -20,10 +20,10 @@ pub fn generate_psk() -> Psk {
 
 /// Encrypt plaintext, producing ciphertext + 16-byte authentication tag.
 /// `nonce` must be exactly 12 bytes.
-pub fn encrypt(key: &Psk, nonce: &[u8; 12], plaintext: &[u8]) -> Vec<u8> {
+pub fn encrypt(key: &Psk, nonce: &[u8; 12], plaintext: &[u8]) -> Result<Vec<u8>, chacha20poly1305::Error> {
     let cipher = ChaCha20Poly1305::new_from_slice(key).expect("valid key size");
     let nonce = Nonce::from_slice(nonce);
-    cipher.encrypt(nonce, plaintext).expect("encryption failed")
+    cipher.encrypt(nonce, plaintext)
 }
 
 /// Decrypt ciphertext (which includes the 16-byte auth tag appended).
@@ -52,7 +52,7 @@ mod tests {
         let psk = generate_psk();
         let nonce = make_nonce(42, 1);
         let plain = b"hello world";
-        let cipher = encrypt(&psk, &nonce, plain);
+        let cipher = encrypt(&psk, &nonce, plain).unwrap();
         assert_eq!(cipher.len(), plain.len() + 16);
         let dec = decrypt(&psk, &nonce, &cipher).unwrap();
         assert_eq!(&dec, plain);
@@ -62,7 +62,7 @@ mod tests {
     fn tamper_detection() {
         let psk = generate_psk();
         let nonce = make_nonce(42, 1);
-        let mut cipher = encrypt(&psk, &nonce, b"hello");
+        let mut cipher = encrypt(&psk, &nonce, b"hello").unwrap();
         cipher[0] ^= 1;
         assert!(decrypt(&psk, &nonce, &cipher).is_none());
     }
