@@ -26,6 +26,11 @@ pub fn cmd_batch_content(lines: &[String]) -> (Vec<u8>, Option<i32>) {
 }
 
 pub fn cmd_sed(path: &str, pattern: &str, replacement: &str) -> (Vec<u8>, Option<i32>) {
+    // 路径安全检查：拒绝包含 .. 的路径
+    if path.contains("..") {
+        return (b"sed: path must not contain '..'\n".to_vec(), Some(1));
+    }
+
     let new_content = match std::fs::read_to_string(path) {
         Ok(c) => c.replace(pattern, replacement),
         Err(e) => return (format!("read error: {}\n", e).into_bytes(), Some(1)),
