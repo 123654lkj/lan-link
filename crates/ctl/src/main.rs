@@ -1,6 +1,21 @@
-//! lan-linkctl — 局域网远程管理 CLI
-//! 通过 UDP 加密通道向 lan-linkd 发送命令，
-//! 支持远程执行、文件传输、系统管理等功能
+//! lan-linkctl — 局域网远程管理 CLI 客户端
+//!
+//! 通过 UDP 加密通道向 lan-linkd 守护进程发送命令。
+//! 支持 50+ 管理子命令，涵盖文件操作、系统管理、网络工具、服务管理、Docker 等。
+//!
+//! # 工作模式
+//!
+//! - **NativeCmd**（推荐）— 结构化命令，在 daemon 端用 Rust 直接执行
+//! - **Exec** — 流式 shell 执行，支持实时 stdout/stderr 输出
+//! - **Iexec/Shell** — 交互式执行，支持 stdin 双向通道
+//! - **Push/Pull** — 文件传输，块确认机制，带进度显示
+//!
+//! # 连接流程
+//!
+//! 1. 创建随机 `conn_id`，发送 SYN 包
+//! 2. 等待 daemon 回复 SYN-ACK
+//! 3. 发送加密 Hello 协商能力
+//! 4. 发送命令并流式接收输出
 
 use clap::{Parser, Subcommand};
 use lan_link_protocol::crypto::{self, Psk};

@@ -1,7 +1,17 @@
-//! Video engine: screen capture + hardware encoding.
+//! lan-link-video — 视频捕获与编码引擎（预留）
 //!
-//! Windows: DXGI Desktop Duplication API + NVENC (via nvidia-video-codec crate or ffmpeg CLI).
-//! Linux: DRM/KMS framebuffer capture + VA-API encode.
+//! 定义屏幕捕获和硬件编码的 trait 接口，当前所有实现均为桩（stub）。
+//!
+//! # 未来实现计划
+//!
+//! - **Windows 捕获** — DXGI Desktop Duplication API
+//! - **Linux 捕获** — DRM/KMS framebuffer
+//! - **硬件编码** — NVENC (NVIDIA) / VA-API (Intel/AMD)
+//!
+//! # 当前状态
+//!
+//! ⚠️ 本 crate 处于预留阶段，`VideoCapture` 和 `VideoEncoder` trait 已定义，
+//! 但具体实现未完成。捕获和编码函数当前返回 `None`。
 //!
 //! For initial implementation, we use DXGI Output Duplication to capture
 //! a specific monitor's content, then encode with NVENC hardware encoder.

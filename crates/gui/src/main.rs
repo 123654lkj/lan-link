@@ -1,8 +1,15 @@
-﻿//! lan-link-gui: cross-platform native desktop client for lan-link.
+﻿//! lan-link-gui — 跨平台桌面 GUI 客户端
 //!
-//! Self-contained: no WebView, no Node, no browser. Uses eframe/egui with a
-//! glow backend so the same code compiles to Windows, Linux, and (with the
-//! android-native-activity feature) Android APKs.
+//! 基于 eframe/egui 框架，纯 Rust 实现，无需 WebView 或浏览器。
+//! 使用 glow 图形后端，确保跨平台一致性（Windows / Linux / macOS）。
+//!
+//! # 功能
+//!
+//! - **主机管理** — 多主机配置，支持增删改查，配置持久化到 JSON 文件
+//! - **快捷命令** — 预置 10 个常用系统管理命令按钮
+//! - **终端输出** — 4000 行回滚缓冲区，stdout/stderr 双色显示
+//! - **历史记录** — 最近 200 条命令历史，Tab 自动补全
+//! - **自动滚动** — 输出流自动到底，可手动切换
 
 mod client;
 

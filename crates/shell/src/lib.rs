@@ -1,15 +1,25 @@
-//! Shell 执行引擎
+//! lan-link-shell — 跨平台命令执行引擎
 //!
-//! 跨平台命令执行。Unix 用 `sh -c`，Windows 用 `cmd /C`。
-//! 提供同步（exec/exec_with_input）和异步流式（StreamingExec）两种模式。
-
-//! Shell engine: command execution.
+//! 提供三种执行模式：
 //!
-//! Cross-platform streaming exec. On unix, `cmd` is passed to `sh -c`.
-//! On windows, `cmd` is passed to `cmd /C`. Two reader threads drain
-//! stdout and stderr into an mpsc channel, and a waiter thread sends the
-//! exit code on a done channel. Stdin writes are serialised through an
-//! Arc<Mutex<Option<ChildStdin>>>.
+//! - **[`exec()`]** — 同步执行，等待完成后返回 stdout/stderr + 退出码
+//! - **[`exec_with_input()`]** — 同步执行 + 带 stdin 输入
+//! - **[`StreamingExec`]** — 流式执行，通过 `std::sync::mpsc` 通道实时输出
+//!
+//! # 跨平台
+//!
+//! | 平台 | Shell |
+//! |------|-------|
+//! | Unix (Linux/macOS) | `sh -c <cmd>` |
+//! | Windows | `cmd /C <cmd>` |
+//!
+//! # 线程模型
+//!
+//! `StreamingExec::spawn()` 启动三个后台线程：
+//!
+//! 1. **ll-shell-stdout** — 读取子进程 stdout
+//! 2. **ll-shell-stderr** — 读取子进程 stderr
+//! 3. **ll-shell-wait** — 等待子进程退出
 
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};

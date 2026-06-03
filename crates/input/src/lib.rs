@@ -1,4 +1,19 @@
-﻿//! Input engine: keyboard/mouse capture and injection.
+﻿//! lan-link-input — 输入事件捕获与注入
+//!
+//! 定义跨平台的输入捕获/注入 trait，以及键盘/鼠标事件的数据类型。
+//!
+//! # 平台实现
+//!
+//! | 平台 | 捕获 | 注入 |
+//! |------|------|------|
+//! | Linux | [`linux::LinuxInputCapture`] — 通过 `evdev` 读取 `/dev/input/event*` | [`linux::LinuxInputInjector`] — 通过 `uinput` 写入 `/dev/uinput` |
+//! | Windows | [`win::WinInputCapture`] — 通过 `GetCursorPos` 轮询 | [`win::WinInputInjector`] — 通过 `SendInput` WinAPI |
+//!
+//! # 事件类型
+//!
+//! - [`KeyEvent`] — 键盘按键事件：按下/释放，含扫描码和虚拟键码
+//! - [`MouseEvent`] — 鼠标事件：相对位移、按钮点击、滚轮
+//! - [`Modifiers`] — 修饰键状态位：CTRL / ALT / SHIFT / WIN
 
 #[cfg(target_os = "windows")]
 pub mod win;
