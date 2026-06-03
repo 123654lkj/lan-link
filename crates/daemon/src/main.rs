@@ -16,7 +16,7 @@
 
 use clap::Parser;
 use lan_link_protocol::crypto::{self, Psk};
-use lan_link_protocol::frame::{PacketHeader, PacketType, Flags, StreamId, HEADER_SIZE, ControlMsg, NativeCmdType};
+use lan_link_protocol::frame::{PacketHeader, PacketType, Flags, StreamId, HEADER_SIZE, ControlMsg, NativeCmdType, PROTOCOL_VERSION};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::Path;
@@ -295,7 +295,11 @@ async fn handle_control(
         }
         ControlMsg::Hello { version, capabilities } => {
             info!("Hello v{} caps={:?}", version, capabilities);
-            send_control(conn_id, peer, psk, &ControlMsg::HelloAck { version: 1, capabilities: vec!["exec".into(), "input".into()] }, &send_socket).await;
+            if version != PROTOCOL_VERSION {
+                warn!("Incompatible protocol version: client v{}, daemon v{}", version, PROTOCOL_VERSION);
+                return;
+            }
+            send_control(conn_id, peer, psk, &ControlMsg::HelloAck { version: PROTOCOL_VERSION, capabilities: vec!["exec".into(), "input".into()] }, &send_socket).await;
         }
         ControlMsg::NativeCmd { id, cmd } => {
             let (out, exit) = native_cmd::run_native_cmd(&cmd);

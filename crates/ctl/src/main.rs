@@ -353,7 +353,7 @@ impl Ctx {
 
         ctx.seq += 1;
         let hello = encode_control(conn_id, &ctx.psk, ctx.seq, &ControlMsg::Hello {
-            version: 1, capabilities: vec!["exec".into(), "input".into()],
+            version: lan_link_protocol::frame::PROTOCOL_VERSION, capabilities: vec!["exec".into(), "input".into()],
         });
         ctx.socket.send_to(&hello, remote).await?;
 
@@ -649,7 +649,7 @@ async fn main() -> anyhow::Result<()> {
             let mut lat = Vec::new();
             for i in 1..=count {
                 let start = Instant::now();
-                ctx.send_control(&ControlMsg::Hello { version: 1, capabilities: vec!["ping".into()] }).await?;
+                ctx.send_control(&ControlMsg::Hello { version: lan_link_protocol::frame::PROTOCOL_VERSION, capabilities: vec!["ping".into()] }).await?;
                 ctx.recv_control(Duration::from_secs(3)).await?;
                 let e = start.elapsed(); lat.push(e);
                 println!("Reply from {}: time={:.2}ms", ctx.remote, e.as_secs_f64() * 1000.0);

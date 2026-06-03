@@ -159,7 +159,7 @@ impl Connection {
         anyhow::ensure!(got_syn_ack, "no SYN-ACK from {}", peer);
 
         // Send encrypted Hello
-        let hello = ControlMsg::Hello { version: 1, capabilities: vec!["exec".into(), "input".into()] };
+        let hello = ControlMsg::Hello { version: lan_link_protocol::frame::PROTOCOL_VERSION, capabilities: vec!["exec".into(), "input".into()] };
         let mut conn = Connection {
             socket: Arc::new(socket),
             peer, psk, conn_id,

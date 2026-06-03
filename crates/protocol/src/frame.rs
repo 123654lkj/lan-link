@@ -20,6 +20,9 @@
 
 use bytes::{Buf, BufMut};
 
+/// 当前协议版本，Hello 握手时协商使用
+pub const PROTOCOL_VERSION: u16 = 1;
+
 pub const HEADER_SIZE: usize = 38;
 pub const MAX_PAYLOAD: usize = 1400;
 pub const MAX_PACKET: usize = HEADER_SIZE + MAX_PAYLOAD + 16; // +16 auth tag
