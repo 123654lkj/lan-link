@@ -15,7 +15,7 @@ from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 
 HEADER_SIZE = 38
 MAX_PAYLOAD = 1400
-DEFAULT_PSK = "ca989e3c0e5f763c1ba7f3a8308a9445ca1d5b77a3e896d55e4eac86f25dfb1d"
+DEFAULT_PSK = ""
 
 class Config:
     """Read config from %APPDATA%\\lan-link\\config.json. Falls back to defaults."""

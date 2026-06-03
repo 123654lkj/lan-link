@@ -18,3 +18,4 @@ dist-gui/
 dist/
 client_win.py.bak
 *.zip
+.codegraph/

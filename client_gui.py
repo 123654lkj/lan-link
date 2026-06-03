@@ -7,9 +7,11 @@
 
 import json
 import os
+import secrets
 import sys
 import threading
 import tkinter as tk
+from tkinter import messagebox
 from tkinter import ttk
 
 from client_win import LanLinkClient
@@ -65,9 +67,9 @@ def load_config():
     return {
         "hosts": [
             {"name": "团子", "addr": "192.168.31.244:9876",
-             "psk": "ca989e3c0e5f763c1ba7f3a8308a9445ca1d5b77a3e896d55e4eac86f25dfb1d"},
+             "psk": ""},
             {"name": "本机", "addr": "127.0.0.1:9876",
-             "psk": "ca989e3c0e5f763c1ba7f3a8308a9445ca1d5b77a3e896d55e4eac86f25dfb1d"},
+             "psk": ""},
         ],
         "active": 0,
         "history": [],
@@ -584,6 +586,23 @@ class App(tk.Tk):
         if self.gui_client.is_connected:
             self.gui_client.disconnect()
         else:
+            host = self.gui_client.active_host
+            if not host.get("psk", ""):
+                ret = messagebox.askyesno(
+                    title="PSK 未配置",
+                    message=(
+                        "主机「%s」未设置 PSK(预共享密钥)。\n\n"
+                        + "PSK 用于加密通信，两端需使用相同的 64 位十六进制密钥。\n\n"
+                        + "是否自动生成随机 PSK？\n"
+                        + "(选「是」自动生成，选「否」手动输入)"
+                        % host["name"]
+                    )
+                )
+                if ret:
+                    host["psk"] = secrets.token_hex(32)
+                    self._render_hosts()
+                else:
+                    return
             try:
                 self.gui_client.connect()
             except Exception:
@@ -762,7 +781,7 @@ class App(tk.Tk):
         self.gui_client._config["hosts"].append({
             "name": f"主机{n}",
             "addr": "127.0.0.1:9876",
-            "psk": "ca989e3c0e5f763c1ba7f3a8308a9445ca1d5b77a3e896d55e4eac86f25dfb1d",
+            "psk": "",
         })
         self.host_combo.configure(values=self._host_names())
         self._render_hosts()
