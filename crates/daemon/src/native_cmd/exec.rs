@@ -38,7 +38,7 @@ pub fn cmd_sed(path: &str, pattern: &str, replacement: &str) -> (Vec<u8>, Option
 
 pub fn cmd_pkill(name: &str, signal: u32) -> (Vec<u8>, Option<i32>) {
     match std::process::Command::new("/usr/bin/pkill")
-        .arg("-f").arg(signal.to_string()).arg(name)
+        .arg(format!("-{}", signal)).arg("-f").arg(name)
         .output()
     {
         Ok(o) => (o.stdout, o.status.code()),
