@@ -4,7 +4,6 @@ members = [
     "crates/protocol",
     "crates/shell",
     "crates/video",
-    "crates/input",
     "crates/daemon",
     "crates/ctl",
     "crates/gui",

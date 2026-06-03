@@ -42,8 +42,6 @@ enum ExecCmd {
 type ExecMap = Arc<AsyncMutex<HashMap<u32, tokio::sync::mpsc::UnboundedSender<ExecCmd>>>>;
 fn new_exec_map() -> ExecMap { Arc::new(AsyncMutex::new(HashMap::new())) }
 
-#[cfg(target_os = "linux")]
-use lan_link_input::linux::LinuxInputInjector;
 
 const PSK_PATH: &str = "/etc/lan-link/psk";
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
@@ -278,8 +276,7 @@ async fn handle_packet_inner(
                 }
             } else if stream_id == StreamId::Input as u16 {
                 #[cfg(target_os = "linux")]
-                handle_input_linux(&plaintext, peer);
-                #[cfg(not(target_os = "linux"))]
+                    #[cfg(not(target_os = "linux"))]
                 debug!("Input ignored (not Linux)");
             }
         }
@@ -309,15 +306,9 @@ static INJECT_COUNT: AtomicU64 = AtomicU64::new(0);
 static INJECTOR: OnceLock<Mutex<LinuxInputInjector>> = OnceLock::new();
 
 #[cfg(target_os = "linux")]
-fn injector() -> std::sync::MutexGuard<'static, LinuxInputInjector> {
-    INJECTOR.get_or_init(|| Mutex::new(LinuxInputInjector::new()))
-        .lock().unwrap()
-}
 
-#[cfg(target_os = "linux")]
 fn handle_input_linux(data: &[u8], peer: SocketAddr) {
-    use lan_link_input::InputInjector;
-    if let Ok(ev) = bincode::deserialize::<lan_link_input::MouseEvent>(data) {
+        if let Ok(ev) = bincode::deserialize::<lan_link_input::MouseEvent>(data) {
         debug!("Mouse event from {}: {:?}", peer, ev);
         let mut inj = injector();
         let bytes = inj.inject_mouse(&ev);

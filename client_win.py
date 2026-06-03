@@ -1,620 +1,2167 @@
-#!/usr/bin/env python3
-"""lan-link Windows client: exec + input capture/injection.
-Uses stdlib + cryptography. Talks to lan-linkd daemon.
-"""
-import socket
-import struct
-import sys
-import time
-import argparse
-import random
-import ctypes
-import ctypes.wintypes as wt
-
-from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
-
-HEADER_SIZE = 38
-MAX_PAYLOAD = 1400
-DEFAULT_PSK = ""
-
-class Config:
-    """Read config from %APPDATA%\\lan-link\\config.json. Falls back to defaults."""
-    DEFAULTS = {
-        "addr": "192.168.31.244:9876",
-        "psk": DEFAULT_PSK,
-        "log_dir": "",  # empty -> use %LOCALAPPDATA%\\lan-link
-        "log_max_bytes": 1048576,
-        "heartbeat_interval": 10.0,
-        "reconnect_backoff": [0.5, 1.0, 2.0, 5.0, 10.0],
-    }
-
-    def __init__(self):
-        import os, json
-        self.path = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "lan-link", "config.json")
-        self.values = dict(self.DEFAULTS)
-        try:
-            with open(self.path, "r", encoding="utf-8") as f:
-                user = json.load(f)
-            for k, v in user.items():
-                if k in self.DEFAULTS:
-                    self.values[k] = v
-        except FileNotFoundError:
-            pass
-        except Exception as e:
-            sys.stderr.write("config read err: %s\n" % e)
-
-    def get(self, key):
-        return self.values[key]
-
-    def write_default(self):
-        """Write default config file so user can edit."""
-        import os, json
-        os.makedirs(os.path.dirname(self.path), exist_ok=True)
-        with open(self.path, "w", encoding="utf-8") as f:
-            json.dump(self.DEFAULTS, f, indent=2)
-
-
-class Log:
-    """Log to file (rotating) + stderr when not in --daemon mode."""
-    def __init__(self, name, max_bytes=1048576, daemon=False):
-        import os
-        if name:
-            log_dir = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
-            self.log_dir = os.path.join(log_dir, "lan-link")
-        else:
-            self.log_dir = ""
-        self.max_bytes = max_bytes
-        self.daemon = daemon
-        self.fp = None
-        if self.log_dir:
-            try:
-                os.makedirs(self.log_dir, exist_ok=True)
-                self.path = os.path.join(self.log_dir, name + ".log")
-                self.fp = open(self.path, "a", encoding="utf-8", newline="\n")
-            except Exception as e:
-                sys.stderr.write("log open err: %s\n" % e)
-                self.fp = None
-
-    def write(self, level, msg):
-        import time
-        line = "%s [%s] %s" % (time.strftime("%Y-%m-%d %H:%M:%S"), level, msg)
-        if not self.daemon:
-            sys.stderr.write(line + "\n")
-            sys.stderr.flush()
-        if self.fp:
-            try:
-                self.fp.write(line + "\n")
-                self.fp.flush()
-                if self.fp.tell() > self.max_bytes:
-                    self.fp.close()
-                    try:
-                        os.replace(self.path, self.path + ".1")
-                    except OSError:
-                        pass
-                    self.fp = open(self.path, "a", encoding="utf-8", newline="\n")
-            except Exception:
-                pass
-
-    def info(self, msg): self.write("INFO", msg)
-    def warn(self, msg): self.write("WARN", msg)
-    def err(self, msg): self.write("ERR ", msg)
-    def close(self):
-        if self.fp:
-            try: self.fp.close()
-            except: pass
-
-
-
-
-SYN, SYN_ACK, ACK, DATA, RST, HEARTBEAT = 0, 1, 2, 3, 4, 5
-STREAM_CONTROL, STREAM_INPUT = 0, 4
-
-TAG_EXEC, TAG_EXEC_OUTPUT, TAG_KEY_EVENT, TAG_MOUSE_MOVE, TAG_MOUSE_BUTTON, \
-    TAG_MOUSE_WHEEL, TAG_HELLO = 0, 1, 5, 6, 7, 12, 13
-TAG_EXEC_STARTED, TAG_EXEC_CHUNK, TAG_EXEC_DONE, TAG_EXEC_STDIN, TAG_EXEC_SIGNAL = 15, 16, 17, 18, 19
-
-# lan-link-input::MouseButton enum tags
-MOUSE_BTN_LEFT, MOUSE_BTN_RIGHT, MOUSE_BTN_MIDDLE, MOUSE_BTN_X1, MOUSE_BTN_X2 = 0, 1, 2, 3, 4
-# lan-link-input::MouseEvent enum tags
-MOUSE_EV_MOVE, MOUSE_EV_BUTTON, MOUSE_EV_WHEEL = 0, 1, 2
-
-
-def make_nonce(conn_id, seq):
-    return struct.pack("<QI", conn_id & 0xFFFFFFFFFFFFFFFF, seq & 0xFFFFFFFF)
-
-
-def encrypt(psk_hex, nonce, plaintext):
-    return ChaCha20Poly1305(bytes.fromhex(psk_hex)).encrypt(nonce, plaintext, None)
-
-
-def decrypt(psk_hex, nonce, ciphertext):
-    return ChaCha20Poly1305(bytes.fromhex(psk_hex)).decrypt(nonce, ciphertext, None)
-
-
-def build_packet(conn_id, pkt_type, stream_id, seq, flags, nonce, payload=b""):
-    hdr = struct.pack("<Q", conn_id)
-    hdr += struct.pack("<B", pkt_type)
-    hdr += struct.pack("<B", flags)
-    hdr += struct.pack("<H", stream_id)
-    hdr += struct.pack("<I", seq)
-    hdr += struct.pack("<I", 0)  # ack_seq
-    hdr += struct.pack("<I", 0)  # ack_bitmap
-    hdr += struct.pack("<H", len(payload))
-    hdr += nonce
-    assert len(hdr) == HEADER_SIZE
-    return hdr + payload
-
-
-def parse_header(data):
-    if len(data) < HEADER_SIZE:
-        return None
-    return dict(
-        conn_id=struct.unpack("<Q", data[0:8])[0],
-        pkt_type=data[8], flags=data[9],
-        stream_id=struct.unpack("<H", data[10:12])[0],
-        seq=struct.unpack("<I", data[12:16])[0],
-        payload_len=struct.unpack("<H", data[24:26])[0],
-        nonce=data[26:38],
-    )
-
-
-def ser_string(s):
-    data = s.encode("utf-8") if s else b""
-    return struct.pack("<Q", len(data)) + data
-
-
-def ser_vec_str(items):
-    out = struct.pack("<Q", len(items))
-    for s in items:
-        out += ser_string(s)
-    return out
-
-
-def ser_vec_u8(items):
-    n = len(items)
-    return struct.pack("<Q", n) + bytes(items)
-
-
-def control_hello(version, caps):
-    return struct.pack("<I", TAG_HELLO) + struct.pack("<H", version) + ser_vec_str(caps)
-
-
-def control_exec(id, cmd):
-    return struct.pack("<I", TAG_EXEC) + struct.pack("<I", id) + ser_string(cmd)
-
-
-def control_exec_stdin(id, data, close=False):
-    return struct.pack("<I", TAG_EXEC_STDIN) + struct.pack("<I", id) + ser_vec_u8(data) + struct.pack("<B", 1 if close else 0)
-
-def control_exec_signal(id, signo):
-    return struct.pack("<I", TAG_EXEC_SIGNAL) + struct.pack("<I", id) + struct.pack("<I", signo)
-
-# lan-link-input crate formats (not ControlMsg):
-# KeyEvent: bool down (1B) + u16 scancode + u16 vk + u8 modifiers = 6 bytes
-# MouseEvent: enum tag (u32 or u8) + payload
-# bincode default for enum: u32 little-endian tag
-
-def input_key(down, scancode, vk, modifiers=0):
-    # bool is 1 byte in bincode (default config)
-    return struct.pack("<BHHB", 1 if down else 0, scancode, vk, modifiers)
-
-
-def input_mouse_move(dx, dy):
-    # enum tag u32 + struct { i32 dx, i32 dy, bool absolute }
-    return struct.pack("<I", MOUSE_EV_MOVE) + struct.pack("<iiB", dx, dy, 0)
-
-
-def input_mouse_button(button, down):
-    # enum tag u32 + MouseButton enum tag u32 + bool down (1B)
-    return struct.pack("<IIB", MOUSE_EV_BUTTON, button, 1 if down else 0)
-
-
-def input_mouse_wheel(delta, horizontal=False):
-    return struct.pack("<I", MOUSE_EV_WHEEL) + struct.pack("<hB", delta, 1 if horizontal else 0)
-
-
-class LanLinkClient:
-    def __init__(self, addr, psk_hex, log=None, heartbeat_interval=0.0):
-        host, port = addr.split(":")
-        self.addr = (host, int(port))
-        self.psk_hex = psk_hex
-        self.log = log
-        self.heartbeat_interval = heartbeat_interval
-        self._hb_thread = None
-        self._hb_stop = None
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.bind(("0.0.0.0", 0))
-        self.sock.settimeout(2.0)
-        self.conn_id = random.getrandbits(64)
-        self.seq = 0
-        self.connected = False
-
-    def send_raw(self, data):
-        self.sock.sendto(data, self.addr)
-
-    def recv(self, timeout=3.0):
-        self.sock.settimeout(timeout)
-        try:
-            data, _ = self.sock.recvfrom(4096)
-            return data
-        except socket.timeout:
-            return None
-
-    def connect(self, caps=("exec", "input"), retries=1):
-        """SYN -> SYN-ACK -> HELLO with simple retry. Raises on hard failure."""
-        last_err = None
-        for attempt in range(retries + 1):
-            try:
-                # Reset seq on reconnect so server-side does not see stale seq
-                self.seq = 0
-                pkt = build_packet(self.conn_id, SYN, STREAM_CONTROL, 0, 0, b"\x00" * 12)
-                self.send_raw(pkt)
-                data = self.recv(3.0)
-                if not data:
-                    raise RuntimeError("No SYN-ACK")
-                hdr = parse_header(data)
-                if hdr["pkt_type"] != SYN_ACK or hdr["conn_id"] != self.conn_id:
-                    raise RuntimeError("Bad SYN-ACK")
-                self._send_encrypted(STREAM_CONTROL, control_hello(1, list(caps)))
-                self.connected = True
-                if self.log:
-                    self.log.info("connected conn_id=%d" % self.conn_id)
-                self._start_heartbeat()
-                return
-            except Exception as e:
-                last_err = e
-                if self.log:
-                    self.log.warn("connect attempt %d failed: %s" % (attempt + 1, e))
-        raise last_err
-
-    def _start_heartbeat(self):
-        import threading
-        if self.heartbeat_interval <= 0:
-            return
-        if self._hb_thread and self._hb_thread.is_alive():
-            return
-        self._hb_stop = threading.Event()
-
-        def _hb_loop():
-            while not self._hb_stop.is_set():
-                self._hb_stop.wait(self.heartbeat_interval)
-                if self._hb_stop.is_set():
-                    break
-                try:
-                    pkt = build_packet(self.conn_id, HEARTBEAT, 0, 0, 0, b"\x00" * 12)
-                    self.send_raw(pkt)
-                except Exception as e:
-                    if self.log:
-                        self.log.warn("heartbeat err: %s" % e)
-
-        self._hb_thread = threading.Thread(target=_hb_loop, daemon=True)
-        self._hb_thread.start()
-
-    def stop(self):
-        """Tear down heartbeat + close socket."""
-        if self._hb_stop:
-            self._hb_stop.set()
-        self.connected = False
-        try:
-            self.sock.close()
-        except Exception:
-            pass
-
-    def _next_seq(self):
-        self.seq += 1
-        return self.seq
-
-    def _send_encrypted(self, stream, msg):
-        seq = self._next_seq()
-        nonce = make_nonce(self.conn_id, seq)
-        enc = encrypt(self.psk_hex, nonce, msg)
-        self.send_raw(build_packet(self.conn_id, DATA, stream, seq, 1, nonce, enc))
-
-    def exec(self, cmd, timeout=30, stdin_bytes=None, on_chunk=None):
-        """Streaming exec: send Exec, then drain chunks until Done.
-
-        stdin_bytes: optional bytes to write to the process's stdin then close.
-        on_chunk: optional callback(stream, bytes) called for each chunk.
-                     Default writes stdout to sys.stdout, stderr to sys.stderr.
-        Returns (combined_stdout_text, exit_code) or (None, None) on timeout.
-        """
-        import sys as _sys
-        if on_chunk is None:
-            def on_chunk(stream, data):
-                sink = _sys.stderr if stream == 1 else _sys.stdout
-                sink.write(data.decode("utf-8", errors="replace"))
-                sink.flush()
-        self._send_encrypted(STREAM_CONTROL, control_exec(1, cmd))
-        if stdin_bytes is not None:
-            self._send_encrypted(STREAM_CONTROL, control_exec_stdin(1, stdin_bytes, True))
-        deadline = time.time() + timeout
-        out = b""
-        exit_code = None
-        got_done = False
-        saw_started = False
-        while time.time() < deadline and not got_done:
-            data = self.recv(min(2.0, deadline - time.time()))
-            if not data:
-                continue
-            hdr = parse_header(data)
-            if hdr is None or hdr["pkt_type"] != DATA or hdr["stream_id"] != STREAM_CONTROL:
-                continue
-            if hdr["payload_len"] == 0:
-                continue
-            enc = data[HEADER_SIZE:HEADER_SIZE + hdr["payload_len"]]
-            try:
-                plain = decrypt(self.psk_hex, hdr["nonce"], enc)
-            except Exception:
-                continue
-            if len(plain) < 4:
-                continue
-            tag = struct.unpack("<I", plain[0:4])[0]
-            if tag == TAG_EXEC_STARTED:
-                saw_started = True
-            elif tag == TAG_EXEC_CHUNK:
-                pos = 4
-                _id = struct.unpack("<I", plain[pos:pos+4])[0]; pos += 4
-                stream = plain[pos]; pos += 1
-                dlen = struct.unpack("<Q", plain[pos:pos+8])[0]; pos += 8
-                chunk = plain[pos:pos+dlen]
-                if stream == 0: out += chunk
-                on_chunk(stream, chunk)
-            elif tag == TAG_EXEC_DONE:
-                pos = 4
-                _id = struct.unpack("<I", plain[pos:pos+4])[0]; pos += 4
-                has_code = plain[pos]; pos += 1
-                if has_code: exit_code = struct.unpack("<i", plain[pos:pos+4])[0]
-                got_done = True
-                break
-        if not got_done:
-            return None, None
-        return out.decode("utf-8", errors="replace"), exit_code
-
-    def send_key(self, down, scancode, vk, modifiers=0):
-        self._send_encrypted(STREAM_INPUT, input_key(down, scancode, vk, modifiers))
-
-    def send_mouse_move(self, dx, dy):
-        if dx or dy:
-            self._send_encrypted(STREAM_INPUT, input_mouse_move(dx, dy))
-
-    def send_mouse_button(self, button, down):
-        self._send_encrypted(STREAM_INPUT, input_mouse_button(button, down))
-
-    def send_mouse_wheel(self, delta, horizontal=False):
-        self._send_encrypted(STREAM_INPUT, input_mouse_wheel(delta, horizontal))
-
-
-# --- Windows input capture ---
-
-WH_KEYBOARD_LL = 13
-WH_MOUSE_LL = 14
-user32 = ctypes.WinDLL("user32", use_last_error=True)
-
-
-def run_input_capture(client):
-    class KBDLLHOOKSTRUCT(ctypes.Structure):
-        _fields_ = [("vkCode", wt.DWORD), ("scanCode", wt.DWORD),
-                    ("flags", wt.DWORD), ("time", wt.DWORD),
-                    ("dwExtraInfo", ctypes.c_void_p)]
-
-    class MSLLHOOKSTRUCT(ctypes.Structure):
-        _fields_ = [("pt", wt.POINT), ("mouseData", wt.DWORD),
-                    ("flags", wt.DWORD), ("time", wt.DWORD),
-                    ("dwExtraInfo", ctypes.c_void_p)]
-
-    HOOKPROC = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_int, wt.WPARAM, ctypes.c_void_p)
-
-    pt = wt.POINT()
-    user32.GetCursorPos(ctypes.byref(pt))
-    last_x, last_y = [pt.x], [pt.y]
-
-    def kb_proc(nCode, wParam, lParam):
-        if nCode >= 0:
-            kb = ctypes.cast(lParam, ctypes.POINTER(KBDLLHOOKSTRUCT))[0]
-            down = (wParam == 0x0100)
-            try:
-                client.send_key(down, kb.scanCode, kb.vkCode)
-            except Exception as e:
-                sys.stderr.write("key err: %s\n" % e)
-        return user32.CallNextHookEx(None, nCode, wParam, lParam)
-
-    def mouse_proc(nCode, wParam, lParam):
-        if nCode >= 0:
-            m = ctypes.cast(lParam, ctypes.POINTER(MSLLHOOKSTRUCT))[0]
-            x, y = m.pt.x, m.pt.y
-            dx, dy = x - last_x[0], y - last_y[0]
-            last_x[0], last_y[0] = x, y
-            try:
-                if dx or dy:
-                    client.send_mouse_move(dx, dy)
-                if wParam == 0x0201: client.send_mouse_button(MOUSE_BTN_LEFT, True)
-                elif wParam == 0x0202: client.send_mouse_button(MOUSE_BTN_LEFT, False)
-                elif wParam == 0x0204: client.send_mouse_button(MOUSE_BTN_RIGHT, True)
-                elif wParam == 0x0205: client.send_mouse_button(MOUSE_BTN_RIGHT, False)
-                elif wParam == 0x0207: client.send_mouse_button(MOUSE_BTN_MIDDLE, True)
-                elif wParam == 0x0208: client.send_mouse_button(MOUSE_BTN_MIDDLE, False)
-                elif wParam == 0x020A:
-                    delta = ctypes.c_short(m.mouseData >> 16).value
-                    client.send_mouse_wheel(delta)
-            except Exception as e:
-                sys.stderr.write("mouse err: %s\n" % e)
-        return user32.CallNextHookEx(None, nCode, wParam, lParam)
-
-    kb_hook = user32.SetWindowsHookExW(WH_KEYBOARD_LL, HOOKPROC(kb_proc), None, 0)
-    mouse_hook = user32.SetWindowsHookExW(WH_MOUSE_LL, HOOKPROC(mouse_proc), None, 0)
-    if not kb_hook or not mouse_hook:
-        raise RuntimeError("SetWindowsHookExW failed")
-    if hasattr(client, "log") and client.log:
-        client.log.info("Input capture started")
-    else:
-        print("Input capture started. Ctrl+C to stop.", flush=True)
-
-    class MSG(ctypes.Structure):
-        _fields_ = [("hwnd", wt.HWND), ("message", wt.UINT), ("wParam", wt.WPARAM),
-                    ("lParam", wt.LPARAM), ("time", wt.DWORD), ("pt", wt.POINT)]
-
-    msg = MSG()
-    while True:
-        ret = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
-        if ret <= 0:
-            break
-        user32.TranslateMessage(ctypes.byref(msg))
-        user32.DispatchMessageW(ctypes.byref(msg))
-
-    user32.UnhookWindowsHookEx(kb_hook)
-    user32.UnhookWindowsHookEx(mouse_hook)
-
-
-def main():
-    import signal
-    ap = argparse.ArgumentParser(description="lan-link Windows 远程命令执行工具")
-    ap.add_argument("--addr", default=None, help="daemon addr host:port (default from config)")
-    ap.add_argument("--psk", default=None, help="PSK hex (default from config)")
-    ap.add_argument("--daemon", action="store_true", help="run as long-lived service with file logging + auto-reconnect")
-    ap.add_argument("--write-config", action="store_true", help="write default config.json and exit")
-    ap.add_argument("--show-config", action="store_true", help="print resolved config and exit")
-    ap.add_argument("--auto-reconnect", action="store_true", help="auto-reconnect on disconnect (default in --daemon)")
-    sub = ap.add_subparsers(dest="cmd", required=False)
-
-    p_exec = sub.add_parser("exec")
-    p_exec.add_argument("command", nargs=argparse.REMAINDER)
-    sub.add_parser("input")
-
-    p_k = sub.add_parser("test-keystroke")
-    p_k.add_argument("scancode", type=int)
-    p_k.add_argument("vk", type=int)
-    p_k.add_argument("--count", type=int, default=1)
-
-    p_m = sub.add_parser("test-mousemove")
-    p_m.add_argument("dx", type=int)
-    p_m.add_argument("dy", type=int)
-    p_m.add_argument("--count", type=int, default=10)
-    p_m.add_argument("--interval", type=float, default=0.05)
-
-    args = ap.parse_args()
-
-    cfg = Config()
-    addr = args.addr or cfg.get("addr")
-    psk = args.psk or cfg.get("psk")
-
-    if args.write_config:
-        cfg.write_default()
-        print("Config written to %s" % cfg.path)
-        return
-    if args.show_config:
-        print("Config file: %s" % cfg.path)
-        for k, v in cfg.values.items():
-            print("  %s = %s" % (k, v))
-        return
-
-    log = Log("daemon" if args.daemon else "", daemon=args.daemon)
-    log.info("lan-link client start (daemon=%s, addr=%s)" % (args.daemon, addr))
-
-    if args.daemon:
-        # Detach from console window so this process can run without a visible cmd
-        try:
-            import ctypes
-            whnd = ctypes.windll.kernel32.GetConsoleWindow()
-            if whnd:
-                ctypes.windll.user32.ShowWindow(whnd, 0)  # SW_HIDE
-        except Exception:
-            pass
-        # Also try to free stdout/stderr in case parent is a terminal
-        try:
-            sys.stdout = open("nul", "w")
-            sys.stderr = open("nul", "w")
-        except Exception:
-            pass
-
-    auto_reconnect = args.daemon or args.auto_reconnect
-    # Enable HB for any long-running mode (input, --daemon, --auto-reconnect)
-    # Disable only for one-shot exec commands.
-    hb_interval = cfg.get("heartbeat_interval") if (args.daemon or args.cmd == "input" or args.auto_reconnect) else 0.0
-
-    def _build_client():
-        return LanLinkClient(addr, psk, log=log, heartbeat_interval=hb_interval)
-
-    def _connect_with_retry(c):
-        if not args.daemon:
-            print("Connecting to %s..." % addr, flush=True)
-        backoff = list(cfg.get("reconnect_backoff"))
-        idx = 0
-        while True:
-            try:
-                c.connect()
-                if not args.daemon:
-                    print("Connected (conn_id=%d)." % c.conn_id, flush=True)
-                return
-            except Exception as e:
-                wait = backoff[min(idx, len(backoff) - 1)]
-                idx += 1
-                log.err("connect failed: %s; retry in %.1fs" % (e, wait))
-                if not args.daemon:
-                    print("connect failed: %s; retry in %.1fs" % (e, wait), file=sys.stderr, flush=True)
-                if not auto_reconnect:
-                    raise
-                time.sleep(wait)
-                # rebuild conn_id so server treats as fresh
-                c.conn_id = random.getrandbits(64)
-
-    client = _build_client()
-    _connect_with_retry(client)
-
-    # Handle graceful shutdown via SIGINT/SIGTERM
-    stop_event = None
-    if args.daemon:
-        stop_event = [False]
-        def _handler(sig, frame):
-            log.info("got signal %d, stopping" % sig)
-            stop_event[0] = True
-        try:
-            signal.signal(signal.SIGINT, _handler)
-            signal.signal(signal.SIGTERM, _handler)
-        except Exception:
-            pass
-
-    if args.cmd == "exec":
-        cmd = " ".join(args.command) if args.command else "echo hello"
-        # If stdin is not a tty (piped/redirected), forward it to remote then close
-        stdin_data = None
-        if not sys.stdin.isatty():
-            try:
-                stdin_data = sys.stdin.buffer.read()
-            except Exception:
-                stdin_data = None
-        out, code = client.exec(cmd, stdin_bytes=stdin_data, timeout=300.0)
-        if out is None and code is None:
-            print("No response / timeout", file=sys.stderr)
-            sys.exit(124)  # same as `timeout` cmd
-        if code is not None:
-            sys.exit(code)
-        sys.exit(0)
-    elif args.cmd == "input":
-        # Re-implement minimal wrapper: pass log; we keep the existing run_input_capture
-        # but we can post a WM_QUIT to break the GetMessageW loop.
-        if args.daemon and stop_event is not None:
-            # Background thread: watch stop_event, then PostQuitMessage
-            import threading
-            def _watcher():
-                while not stop_event[0]:
-                    time.sleep(0.5)
-                log.info("PostQuitMessage(0)")
-                user32.PostQuitMessage(0)
-            threading.Thread(target=_watcher, daemon=True).start()
-        run_input_capture(client)
-    elif args.cmd == "test-keystroke":
-        for _ in range(args.count):
-            client.send_key(True, args.scancode, args.vk)
-            time.sleep(0.05)
-            client.send_key(False, args.scancode, args.vk)
-            time.sleep(0.05)
-        print("Sent %d keystrokes" % args.count, flush=True)
-    elif args.cmd == "test-mousemove":
-        for i in range(args.count):
-            client.send_mouse_move(args.dx, args.dy)
-            time.sleep(args.interval)
-        print("Sent %d mouse moves (dx=%d, dy=%d)" % (args.count, args.dx, args.dy), flush=True)
-
-
-if __name__ == "__main__":
-    main()
+﻿commit 7fc3a8c69b8c97dd8e39585b969cefebb6db94ba
+Author: xiantuer <xiantuer@tuanzi.local>
+Date:   Wed Jun 3 14:24:20 2026 +0800
+
+    fix: 17 bug 修复（第三轮 code review + 内置审查配置）
+
+diff --git a/client_gui.py b/client_gui.py
+index 1aed640..89e2d1d 100644
+--- a/client_gui.py
++++ b/client_gui.py
+@@ -1,934 +1,936 @@
+-#!/usr/bin/env python3
+-# lan-link desktop GUI client (Codex-style)
+-# Cross-platform standalone desktop app using tkinter (Python stdlib).
+-# Reuses LanLinkClient from client_win.py for the wire protocol.
+-# Run:   python client_gui.py
+-# Package: pyinstaller --noconfirm --noconsole --onefile -n lan-link-gui client_gui.py
+-
+-import json
+-import os
+-import secrets
+-import sys
+-import threading
+-import tkinter as tk
+-from tkinter import messagebox
+-from tkinter import ttk
+-
+-from client_win import LanLinkClient
+-import ctypes
+-
+-def _hide_console():
+-    """Hide console window - called after tkinter init."""
+-    try:
+-        _hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+-        if _hwnd:
+-            ctypes.windll.user32.ShowWindow(_hwnd, 0)  # SW_HIDE
+-    except Exception:
+-        pass
+-
+-APP_NAME = "lan-link 远程命令"
+-
+-BG          = "#13151a"
+-BG_PANEL    = "#1a1d23"
+-BG_INPUT    = "#0f1116"
+-BG_BTN      = "#242830"
+-BG_BTN_HI   = "#2f3540"
+-FG          = "#e8eaed"
+-FG_DIM      = "#8b95a5"
+-FG_LINK     = "#6cb4ee"
+-ACCENT      = "#4ec763"
+-ACCENT_WARN = "#e0a030"
+-ACCENT_ERR  = "#f06050"
+-BORDER      = "#3a4050"
+-
+-FONT_FAMILY = ("Cascadia Mono", "Consolas", "Menlo", "DejaVu Sans Mono")
+-FONT_UI     = ("Segoe UI", "Microsoft YaHei UI", "PingFang SC", "Sans", 10)
+-FONT_MONO   = (FONT_FAMILY[0], 10)
+-FONT_MONO_S = (FONT_FAMILY[0], 9)
+-
+-
+-def _config_path():
+-    base = os.environ.get("APPDATA") or os.path.expanduser("~/.config")
+-    if os.name == "nt" and not os.environ.get("APPDATA"):
+-        base = os.path.expanduser("~")
+-    d = os.path.join(base, "lan-link")
+-    os.makedirs(d, exist_ok=True)
+-    return os.path.join(d, "gui-config.json")
+-
+-
+-def load_config():
+-    p = _config_path()
+-    if os.path.exists(p):
+-        try:
+-            with open(p, "r", encoding="utf-8") as f:
+-                return json.load(f)
+-        except Exception:
+-            pass
+-    return {
+-        "hosts": [
+-            {"name": "团子", "addr": "192.168.31.244:9876",
+-             "psk": ""},
+-            {"name": "本机", "addr": "127.0.0.1:9876",
+-             "psk": ""},
+-        ],
+-        "active": 0,
+-        "history": [],
+-    }
+-
+-
+-def save_config(cfg):
+-    p = _config_path()
+-    try:
+-        with open(p, "w", encoding="utf-8") as f:
+-            json.dump(cfg, f, indent=2)
+-    except Exception as e:
+-        print("[save_config err]", e, file=sys.stderr)
+-
+-
+-QUICK_COMMANDS = [
+-    ("系统信息", "uname -a",
+-     "查看内核版本与系统架构"),
+-    ("运行时间", "uptime",
+-     "显示系统已运行时长和平均负载"),
+-    ("当前用户", "whoami",
+-     "显示当前登录用户名"),
+-    ("网卡地址", "ip -4 addr show",
+-     "列出所有 IPv4 地址与网卡状态"),
+-    ("内存用量", "free -h",
+-     "查看物理内存与交换分区用量"),
+-    ("磁盘用量", "df -h /",
+-     "查看根分区剩余空间"),
+-    ("服务状态", "systemctl status lan-linkd --no-pager",
+-     "查看 lan-link 守护进程状态"),
+-    ("最近日志", "tail -n 50 /var/log/lan-linkd.log 2>/dev/null || journalctl -u lan-linkd -n 50 --no-pager",
+-     "查看 lan-link 最近 50 行日志"),
+-]
+-
+-
+-class ToolTip:
+-    def __init__(self, widget, text):
+-        self.widget = widget
+-        self.text = text
+-        self.tip = None
+-        widget.bind("<Enter>", self._show, add="+")
+-        widget.bind("<Leave>", self._hide, add="+")
+-
+-    def _show(self, _evt=None):
+-        if self.tip is not None or not self.text:
+-            return
+-        x = self.widget.winfo_rootx() + 18
+-        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 6
+-        self.tip = tw = tk.Toplevel(self.widget)
+-        tw.wm_overrideredirect(True)
+-        tw.wm_geometry(f"+{x}+{y}")
+-        lbl = tk.Label(
+-            tw, text=self.text, justify=tk.LEFT,
+-            background="#ffffe0", foreground="#222",
+-            relief=tk.SOLID,
+-            font=("Microsoft YaHei", 9) if os.name == "nt" else ("Sans", 9),
+-            padx=6, pady=3,
+-        )
+-        lbl.pack()
+-
+-    def _hide(self, _evt=None):
+-        if self.tip is not None:
+-            self.tip.destroy()
+-            self.tip = None
+-
+-
+-
+-class GuiClient:
+-    def __init__(self, on_event):
+-        self.on_event = on_event
+-        self._lock = threading.Lock()
+-        self._client = None
+-        self._config = load_config()
+-        self._busy = False
+-
+-    @property
+-    def active_host(self):
+-        idx = self._config.get("active", 0)
+-        if idx >= len(self._config["hosts"]):
+-            idx = 0
+-        return self._config["hosts"][idx]
+-
+-    def connect(self):
+-        with self._lock:
+-            if self._client is not None:
+-                return
+-            host = self.active_host
+-            self._client = LanLinkClient(host["addr"], host["psk"], log=None, heartbeat_interval=0.0)
+-            try:
+-                self._client.connect()
+-                self.on_event({"type": "status", "text": f"已连接到 {host['addr']}"})
+-            except Exception as e:
+-                self._client = None
+-                self.on_event({"type": "status", "text": f"连接失败: {e}", "error": True})
+-                raise
+-
+-    def disconnect(self):
+-        with self._lock:
+-            if self._client is not None:
+-                try:
+-                    self._client.stop()
+-                except Exception:
+-                    pass
+-                self._client = None
+-                self.on_event({"type": "status", "text": "已断开"})
+-
+-    @property
+-    def is_connected(self):
+-        return self._client is not None
+-
+-    def run(self, cmd):
+-        if self._busy:
+-            self.on_event({"type": "status", "text": "上一条命令还在执行中", "error": True})
+-            return
+-        with self._lock:
+-            if self._client is None:
+-                self.on_event({"type": "status", "text": "未连接", "error": True})
+-                return
+-            client = self._client
+-        self._busy = True
+-        self.on_event({"type": "started"})
+-        threading.Thread(target=self._run_worker, args=(client, cmd), daemon=True).start()
+-
+-    def _run_worker(self, client, cmd):
+-        try:
+-            out, code = client.exec(cmd, timeout=300, on_chunk=self._on_chunk)
+-            self.on_event({"type": "done", "exit": code})
+-        except Exception as e:
+-            self.on_event({"type": "status", "text": f"执行出错: {e}", "error": True})
+-            self.on_event({"type": "done", "exit": None})
+-        finally:
+-            self._busy = False
+-
+-    def _on_chunk(self, stream, data):
+-        self.on_event({"type": "chunk", "stream": stream, "data": data})
+-
+-
+-
+-class App(tk.Tk):
+-    def __init__(self):
+-        super().__init__()
+-        _hide_console()
+-        self.title(APP_NAME)
+-        self.geometry("1040x720")
+-        self.minsize(680, 420)
+-        self.configure(bg=BG)
+-        self._apply_theme()
+-        self.gui_client = GuiClient(on_event=self._on_event)
+-        self._build_layout()
+-        self._update_status()
+-        self.bind("<Configure>", self._on_resize)
+-        self._reflow_scheduled = False
+-        self.after(500, self._tick)
+-
+-    def _apply_theme(self):
+-        style = ttk.Style(self)
+-        style.theme_use("alt")
+-        s = style
+-        # Global dark background
+-        s.configure(".", background=BG, foreground=FG, fieldbackground=BG_INPUT, bordercolor=BORDER)
+-        s.configure("TFrame", background=BG)
+-        s.configure("Panel.TFrame", background=BG_PANEL)
+-        s.configure("TLabel", background=BG, foreground=FG, font="TkFixedFont")
+-        s.configure("Panel.TLabel", background=BG_PANEL, foreground=FG, font="TkFixedFont")
+-        s.configure("Dim.TLabel", background=BG, foreground=FG_DIM, font="TkFixedFont")
+-        s.configure("Header.TLabel", background=BG, foreground=FG, font=(FONT_UI[0], 10, "bold"))
+-        s.configure("PanelHeader.TLabel", background=BG_PANEL, foreground=FG, font=(FONT_UI[0], 9, "bold"))
+-        s.configure("Status.TLabel", background=BG, foreground=FG_DIM, font="TkFixedFont")
+-        # Quick-cmd buttons — use a named style AND explicitly pass foreground.
+-        # clam theme strips foreground from the base style, so we rely on the map.
+-        s.configure("Quick.TButton", background=BG_BTN, font="TkFixedFont",
+-                    padding=(10, 8), borderwidth=0, relief=tk.FLAT)
+-        s.map("Quick.TButton",
+-              background=[("active", BG_BTN_HI), ("pressed", BG_BTN_HI), ("disabled", BG)],
+-              foreground=[("active", FG), ("pressed", FG), ("!disabled", FG), ("disabled", FG_DIM)])
+-        # Action / Accent buttons
+-        s.configure("Accent.TButton", background=ACCENT, foreground="#0e1116",
+-                    font=(FONT_UI[0], 10, "bold"), padding=(14, 8))
+-        s.map("Accent.TButton", background=[("active", "#5dd875"), ("pressed", "#3ab055")])
+-        s.configure("Danger.TButton", background=ACCENT_ERR, foreground="#fff",
+-                    font="TkFixedFont", padding=(10, 6))
+-        s.map("Danger.TButton", background=[("active", "#ff6259")])
+-        s.configure("Ghost.TButton", background=BG_PANEL, foreground=FG,
+-                    font="TkFixedFont", padding=(6, 4))
+-        s.map("Ghost.TButton", background=[("active", BG_BTN_HI)])
+-        s.configure("Clear.TButton", background=BG_BTN, foreground=FG_DIM,
+-                    font="TkFixedFont", padding=(6, 4))
+-        s.map("Clear.TButton", background=[("active", BG_BTN_HI)])
+-        # Entry (use tk.Entry in layout for reliability)
+-        s.configure("TEntry", fieldbackground=BG_INPUT, foreground=FG,
+-                    bordercolor=BORDER, lightcolor=BORDER, darkcolor=BORDER, padding=(10, 7))
+-        # Combobox
+-        s.configure("TCombobox", fieldbackground=BG_INPUT, foreground=FG,
+-                    background=BG_BTN, arrowcolor=FG, bordercolor=BORDER, padding=(6, 4))
+-        s.map("TCombobox",
+-              fieldbackground=[("readonly", BG_INPUT)],
+-              foreground=[("readonly", FG)],
+-              selectbackground=[("readonly", BG_INPUT)],
+-              selectforeground=[("readonly", FG)])
+-        # Checkbox
+-        s.configure("TCheckbutton", background=BG, foreground=FG_DIM, font="TkFixedFont",
+-                    focuscolor=BG, indicatorcolor=BG_BTN)
+-        s.map("TCheckbutton", background=[("active", BG)],
+-              indicatorcolor=[("selected", ACCENT), ("!selected", BG_BTN)])
+-        # Paned / Scrollbar
+-        s.configure("TPanedwindow", background=BG)
+-        s.configure("Sash", background=BG, sashthickness=4)
+-        s.configure("Vertical.TScrollbar", background=BG, troughcolor=BG,
+-                    bordercolor=BG, arrowcolor=FG_DIM, width=10)
+-        s.configure("Horizontal.TScrollbar", background=BG, troughcolor=BG,
+-                    bordercolor=BG, arrowcolor=FG_DIM, width=10)
+-        # Listbox (classic tk)
+-        s.configure("TListbox", background=BG_INPUT, foreground=FG,
+-                    selectbackground=BG_BTN_HI, selectforeground=FG,
+-                    borderwidth=0, highlightthickness=0, font=FONT_MONO_S)
+-        # Notebook
+-        s.configure("TNotebook", background=BG, bordercolor=BORDER)
+-        s.configure("TNotebook.Tab", background=BG_PANEL, foreground=FG,
+-                    padding=(12, 6), font="TkFixedFont")
+-        s.map("TNotebook.Tab",
+-              background=[("selected", BG_BTN_HI)],
+-              foreground=[("selected", FG)])
+-
+-
+-
+-    def _build_layout(self):
+-        # ---- Top bar -----------------------------------------------------------
+-        top = ttk.Frame(self, padding=(14, 10, 14, 10))
+-        top.pack(side=tk.TOP, fill=tk.X)
+-        ttk.Label(top, text=APP_NAME, style="Header.TLabel").pack(side=tk.LEFT)
+-        # status dot
+-        self.status_dot = tk.Canvas(top, width=8, height=8, bg=BG, highlightthickness=0)
+-        self.status_dot.pack(side=tk.LEFT, padx=(12, 6))
+-        self.status_dot_id = self.status_dot.create_oval(0, 0, 8, 8, fill=ACCENT_WARN, outline="")
+-        self.status_text = ttk.Label(top, text="未连接", style="Status.TLabel")
+-        self.status_text.pack(side=tk.LEFT)
+-        # spacer
+-        ttk.Frame(top).pack(side=tk.LEFT, fill=tk.X, expand=True)
+-        # host selector
+-        ttk.Label(top, text="主机", style="Dim.TLabel").pack(side=tk.LEFT, padx=(0, 6))
+-        self.host_var = tk.StringVar()
+-        self.host_combo = ttk.Combobox(
+-            top, textvariable=self.host_var, state="readonly", width=14,
+-            values=self._host_names(),
+-        )
+-        self.host_combo.pack(side=tk.LEFT, padx=(0, 10))
+-        self.host_combo.bind("<<ComboboxSelected>>", self._on_host_change)
+-        if self.gui_client._config["hosts"]:
+-            self.host_var.set(
+-                self.gui_client._config["hosts"][
+-                    self.gui_client._config.get("active", 0)
+-                ]["name"]
+-            )
+-        # connect button
+-        self.connect_btn = ttk.Button(top, text="连接", style="Accent.TButton",
+-                                      command=self._toggle_connection)
+-        self.connect_btn.pack(side=tk.LEFT)
+-        ttk.Separator(self, orient=tk.HORIZONTAL).pack(side=tk.TOP, fill=tk.X)
+-
+-        # ---- Main split (left + center) ----------------------------------------
+-        self._main_paned = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
+-        main = self._main_paned
+-
+-        # ---- Bottom command bar (pack BEFORE main so it gets space) ---------------
+-        bottom = tk.Frame(self, bg=BG, bd=0)
+-        bottom.pack(side=tk.BOTTOM, fill=tk.X, padx=14, pady=(10, 14))
+-        bottom.columnconfigure(1, weight=1)
+-
+-        tk.Label(bottom, text="$", bg=BG, fg=ACCENT,
+-                 font=(FONT_FAMILY[0], 12, "bold")).grid(row=0, column=0, padx=(0, 8))
+-        self.cmd_var = tk.StringVar()
+-        self.cmd_entry = tk.Entry(
+-            bottom, textvariable=self.cmd_var,
+-            background=BG_INPUT, foreground=FG, insertbackground=FG,
+-            selectbackground=BG_BTN_HI, selectforeground=FG,
+-            borderwidth=1, relief=tk.SOLID, highlightthickness=1,
+-            highlightbackground=BORDER, highlightcolor=ACCENT,
+-            font=FONT_MONO, width=40,
+-        )
+-        self.cmd_entry.grid(row=0, column=1, sticky="ew", padx=(0, 10))
+-        self.cmd_entry.bind("<Return>", self._on_run)
+-        self.cmd_entry.bind("<Tab>", self._on_tab_complete)
+-        self.cmd_entry.bind("<Up>", self._on_history_up)
+-        self.cmd_entry.bind("<Down>", self._on_history_down)
+-        self.cmd_entry.focus_set()
+-        self.cmd_entry.bind("<KeyRelease>", self._on_cmd_type)
+-        # Clear tab state when user types printable characters
+-        self.cmd_entry.bind("<KeyPress>", self._on_key_press)
+-
+-        btn_frame = ttk.Frame(bottom, style="TFrame")
+-        btn_frame.grid(row=0, column=2, sticky="e")
+-        btn_frame.columnconfigure(0, weight=1)
+-
+-        self.run_btn = tk.Button(btn_frame, text="执行", bg=ACCENT, fg="#0e1116",
+-                                 activebackground="#4ec763", font=(FONT_UI[0], 10, "bold"),
+-                                 borderwidth=0, cursor="hand2",
+-                                 command=self._on_run)
+-        self.run_btn.pack(side=tk.LEFT, padx=(0, 6))
+-
+-        self.autoscroll_var = tk.BooleanVar(value=True)
+-        tk.Checkbutton(btn_frame, text="自动滚动", variable=self.autoscroll_var,
+-                       bg=BG, fg=FG_DIM, selectcolor=ACCENT,
+-                       activebackground=BG, activeforeground=FG_DIM,
+-                       font="TkFixedFont", borderwidth=0).pack(side=tk.LEFT, padx=(4, 0))
+-
+-        tk.Button(btn_frame, text="清屏", bg=BG_BTN, fg=FG_DIM,
+-                  activebackground=BG_BTN_HI, font="TkFixedFont",
+-                  borderwidth=0, cursor="hand2",
+-                  command=self._clear_output).pack(side=tk.LEFT, padx=(6, 0))
+-
+-        # Status bar
+-        sep = ttk.Separator(self, orient=tk.HORIZONTAL)
+-        sep.pack(side=tk.BOTTOM, fill=tk.X)
+-        status_bar = ttk.Frame(self, padding=(12, 4))
+-        status_bar.pack(side=tk.BOTTOM, fill=tk.X)
+-        self.addr_status = ttk.Label(status_bar, text="", style="Status.TLabel")
+-        self.addr_status.pack(side=tk.LEFT)
+-        ttk.Frame(status_bar).pack(side=tk.LEFT, fill=tk.X, expand=True)
+-        self.hint = ttk.Label(status_bar,
+-            text="Enter 执行 · ↑↓ 历史 · Ctrl+L 清屏 · F5 保存",
+-            style="Status.TLabel")
+-        self.hint.pack(side=tk.RIGHT)
+-        self.bind_all("<Control-l>", lambda e: self._clear_output())
+-        self.bind_all("<F5>", lambda e: self._save_config())
+-        # Set initial sash position
+-        self.after(100, self._set_initial_sash)
+-
+-        # Main area (packs last, fills remaining space)
+-        main.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+-
+-        # Left panel
+-        left = ttk.Frame(main, style="Panel.TFrame", padding=(14, 14, 14, 14))
+-        main.add(left, weight=1)
+-        left.columnconfigure(0, weight=1)
+-
+-        # --- Quick commands ---
+-        ttk.Label(left, text="常用命令", style="PanelHeader.TLabel").grid(
+-            row=0, column=0, sticky=tk.W, pady=(0, 8))
+-        self.quick_container = ttk.Frame(left, style="Panel.TFrame")
+-        self.quick_container.grid(row=1, column=0, sticky="ew")
+-        self.quick_container.columnconfigure(0, weight=1)
+-        self._quick_cols = 1
+-        self._render_quick_commands()
+-
+-        # --- Separator ---
+-        ttk.Separator(left, orient=tk.HORIZONTAL).grid(
+-            row=2, column=0, sticky="ew", pady=(14, 10))
+-
+-        # --- History ---
+-        hist_hdr = ttk.Frame(left, style="Panel.TFrame")
+-        hist_hdr.grid(row=3, column=0, sticky="ew", pady=(0, 4))
+-        hist_hdr.columnconfigure(0, weight=1)
+-        ttk.Label(hist_hdr, text="历史", style="PanelHeader.TLabel").grid(row=0, column=0, sticky=tk.W)
+-        ttk.Button(hist_hdr, text="清空", style="Ghost.TButton",
+-                   command=self._clear_history).grid(row=0, column=1, sticky=tk.E)
+-        self.history_list = tk.Listbox(
+-            left, height=10, exportselection=False, activestyle="none",
+-            background=BG_INPUT, foreground=FG,
+-            selectbackground=BG_BTN_HI, selectforeground=FG,
+-            borderwidth=1, highlightthickness=0,
+-            relief=tk.SOLID,
+-            font=FONT_MONO_S,
+-        )
+-        self.history_list.grid(row=4, column=0, sticky="nsew")
+-        left.rowconfigure(4, weight=1)
+-        self.history_list.bind("<<ListboxSelect>>", self._on_history_pick)
+-        self.history_list.config(borderwidth=1, highlightthickness=0,
+-                                 relief=tk.SOLID)
+-
+-        # --- Separator ---
+-        ttk.Separator(left, orient=tk.HORIZONTAL).grid(
+-            row=5, column=0, sticky="ew", pady=(14, 10))
+-
+-        # --- Hosts editor ---
+-        hosts_hdr = ttk.Frame(left, style="Panel.TFrame")
+-        hosts_hdr.grid(row=6, column=0, sticky="ew", pady=(0, 4))
+-        hosts_hdr.columnconfigure(0, weight=1)
+-        ttk.Label(hosts_hdr, text="主机", style="PanelHeader.TLabel").grid(row=0, column=0, sticky=tk.W)
+-        ttk.Button(hosts_hdr, text="+ 添加", style="Ghost.TButton",
+-                   command=self._add_host).grid(row=0, column=1, sticky=tk.E)
+-        self.hosts_box = ttk.Frame(left, style="Panel.TFrame")
+-        self.hosts_box.grid(row=7, column=0, sticky="ew")
+-        self.hosts_box.columnconfigure(0, weight=1)
+-        self._render_hosts()
+-
+-        # ---- Center terminal ---------------------------------------------------
+-        # Center terminal frame
+-        center = ttk.Frame(main, style="TFrame")
+-        main.add(center, weight=4)
+-        # term_frame fills the entire PanedWindow pane
+-        term_frame = ttk.Frame(center, style="TFrame")
+-        term_frame.pack(fill=tk.BOTH, expand=True)
+-
+-        self.output = tk.Text(
+-            term_frame, wrap=tk.NONE,
+-            background=BG_INPUT, foreground=FG,
+-            insertbackground=FG, selectbackground=BG_BTN_HI, selectforeground=FG,
+-            font=FONT_MONO, padx=14, pady=10, relief=tk.FLAT,
+-            borderwidth=1, highlightthickness=1,
+-            highlightbackground=BORDER, highlightcolor=BORDER,
+-            undo=False, takefocus=False,
+-        )
+-        self.output.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+-        self.output.tag_configure("stdout", foreground=FG)
+-        self.output.tag_configure("stderr", foreground=ACCENT_ERR)
+-        self.output.tag_configure("system", foreground=FG_LINK)
+-        self.output.tag_configure("prompt", foreground=ACCENT)
+-        self.output.tag_configure("dim",    foreground=FG_DIM)
+-        self.output.tag_configure("hi",     foreground=FG, background="#1a212b")
+-        # scrollbars — dark-themed, placed alongside the Text widget
+-        ysb = ttk.Scrollbar(term_frame, orient=tk.VERTICAL, command=self.output.yview)
+-        ysb.pack(side=tk.RIGHT, fill=tk.Y)
+-        xsb = ttk.Scrollbar(term_frame, orient=tk.HORIZONTAL, command=self.output.xview)
+-        xsb.pack(side=tk.BOTTOM, fill=tk.X)
+-        self.output.configure(yscrollcommand=ysb.set, xscrollcommand=xsb.set)
+-        self.output.bind("<Key>", self._block_text_input)
+-        self.output.bind("<Control-c>", self._on_copy)
+-        self.output.bind("<Control-C>", self._on_copy)
+-        self.output.bind("<Control-a>", self._on_select_all)
+-        self.output.bind("<Control-A>", self._on_select_all)
+-        # Right-click context menu
+-        self.output.bind("<Button-3>", self._show_context_menu)
+-        self.output.configure(state=tk.DISABLED)
+-
+-        
+-
+-
+-
+-    # ---- render helpers ----
+-    def _render_quick_commands(self):
+-        for w in self.quick_container.winfo_children():
+-            w.destroy()
+-        for i, (label, cmd, tip) in enumerate(QUICK_COMMANDS):
+-            r, c = divmod(i, self._quick_cols)
+-            b = ttk.Button(
+-                self.quick_container, text=label,
+-                style="Quick.TButton",
+-                command=lambda v=cmd: self._fill_command(v),
+-            )
+-            b.grid(row=r, column=c, sticky="ew",
+-                   padx=(0 if c == 0 else 4, 0), pady=2, ipadx=6, ipady=4)
+-            ToolTip(b, tip)
+-
+-    def _reflow_quick(self, cols):
+-        if cols == self._quick_cols:
+-            return
+-        self._quick_cols = cols
+-        for w in self.quick_container.winfo_children():
+-            w.destroy()
+-        for c in range(cols):
+-            self.quick_container.columnconfigure(c, weight=1)
+-        for i, (label, cmd, tip) in enumerate(QUICK_COMMANDS):
+-            r, c = divmod(i, cols)
+-            b = ttk.Button(
+-                self.quick_container, text=label,
+-                style="Quick.TButton",
+-                command=lambda v=cmd: self._fill_command(v),
+-            )
+-            b.grid(row=r, column=c, sticky="ew",
+-                   padx=(0 if c == 0 else 4, 0), pady=2, ipadx=6, ipady=4)
+-            ToolTip(b, tip)
+-
+-    def _render_hosts(self):
+-        for w in self.hosts_box.winfo_children():
+-            w.destroy()
+-        hosts = self.gui_client._config["hosts"]
+-        for i, h in enumerate(hosts):
+-            row = ttk.Frame(self.hosts_box, style="Panel.TFrame")
+-            row.pack(fill=tk.X, pady=(0, 8))
+-            row.columnconfigure(1, weight=1)
+-            ttk.Label(row, text="名字", style="Panel.TLabel").grid(row=0, column=0, sticky=tk.W, pady=(0, 1))
+-            ttk.Label(row, text="地址", style="Panel.TLabel").grid(row=1, column=0, sticky=tk.W, pady=(0, 1))
+-            ttk.Label(row, text="PSK ", style="Panel.TLabel").grid(row=2, column=0, sticky=tk.W, pady=(0, 1))
+-            nv = tk.StringVar(value=h["name"])
+-            av = tk.StringVar(value=h["addr"])
+-            pv = tk.StringVar(value=h["psk"])
+-            tk.Entry(row, textvariable=nv,
+-                     background=BG_INPUT, foreground=FG, insertbackground=FG,
+-                     borderwidth=1, relief=tk.SOLID, highlightthickness=1,
+-                     highlightbackground=BORDER, highlightcolor=ACCENT,
+-                     font=FONT_MONO_S).grid(row=0, column=1, sticky="ew", padx=(8, 0), pady=(0, 1))
+-            tk.Entry(row, textvariable=av,
+-                     background=BG_INPUT, foreground=FG, insertbackground=FG,
+-                     borderwidth=1, relief=tk.SOLID, highlightthickness=1,
+-                     highlightbackground=BORDER, highlightcolor=ACCENT,
+-                     font=FONT_MONO_S).grid(row=1, column=1, sticky="ew", padx=(8, 0), pady=(0, 1))
+-            tk.Entry(row, textvariable=pv, show="*",
+-                     background=BG_INPUT, foreground=FG, insertbackground=FG,
+-                     borderwidth=1, relief=tk.SOLID, highlightthickness=1,
+-                     highlightbackground=BORDER, highlightcolor=ACCENT,
+-                     font=FONT_MONO_S).grid(row=2, column=1, sticky="ew", padx=(8, 0), pady=(0, 1))
+-            btns = ttk.Frame(row, style="Panel.TFrame")
+-            btns.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+-            ttk.Button(btns, text="保存", style="Ghost.TButton",
+-                       command=lambda i=i, n=nv, a=av, p=pv: self._save_host(i, n, a, p)).pack(side=tk.LEFT)
+-            if len(hosts) > 1:
+-                ttk.Button(btns, text="删除", style="Ghost.TButton",
+-                           command=lambda i=i: self._remove_host(i)).pack(side=tk.LEFT, padx=(6, 0))
+-
+-    # ---- callbacks ----
+-    def _host_names(self):
+-        return [h["name"] for h in self.gui_client._config["hosts"]]
+-
+-    def _on_host_change(self, _evt=None):
+-        name = self.host_var.get()
+-        for i, h in enumerate(self.gui_client._config["hosts"]):
+-            if h["name"] == name:
+-                self.gui_client._config["active"] = i
+-                self._save_config()
+-                break
+-        self._update_status()
+-
+-    def _toggle_connection(self):
+-        if self.gui_client.is_connected:
+-            self.gui_client.disconnect()
+-        else:
+-            host = self.gui_client.active_host
+-            if not host.get("psk", ""):
+-                ret = messagebox.askyesno(
+-                    title="PSK 未配置",
+-                    message=(
+-                        "主机「%s」未设置 PSK(预共享密钥)。\n\n"
+-                        + "PSK 用于加密通信，两端需使用相同的 64 位十六进制密钥。\n\n"
+-                        + "是否自动生成随机 PSK？\n"
+-                        + "(选「是」自动生成，选「否」手动输入)"
+-                        % host["name"]
+-                    )
+-                )
+-                if ret:
+-                    host["psk"] = secrets.token_hex(32)
+-                    self._render_hosts()
+-                else:
+-                    return
+-            try:
+-                self.gui_client.connect()
+-            except Exception:
+-                pass
+-        self._update_status()
+-
+-    def _update_status(self):
+-        host = self.gui_client.active_host
+-        self.addr_status.configure(text=f"  {host['name']}  ·  {host['addr']}")
+-        if self.gui_client.is_connected:
+-            self.status_dot.itemconfigure(self.status_dot_id, fill=ACCENT)
+-            self.status_text.configure(text="已连接", foreground=ACCENT)
+-            self.connect_btn.configure(text="断开", style="Danger.TButton")
+-        else:
+-            self.status_dot.itemconfigure(self.status_dot_id, fill=ACCENT_WARN)
+-            self.status_text.configure(text="未连接", foreground=ACCENT_WARN)
+-            self.connect_btn.configure(text="连接", style="Accent.TButton")
+-
+-    def _fill_command(self, cmd):
+-        self.cmd_var.set(cmd)
+-        self.cmd_entry.focus_set()
+-        self.cmd_entry.bind("<KeyRelease>", self._on_cmd_type)
+-
+-    def _on_history_pick(self, _evt=None):
+-        sel = self.history_list.curselection()
+-        if sel:
+-            self._fill_command(self.history_list.get(sel[0]))
+-
+-    def _clear_history(self):
+-        self.gui_client._config["history"] = []
+-        self._refresh_history()
+-        self._save_config()
+-
+-    def _on_tab_complete(self, _evt=None):
+-        """Tab key completion: show command with Chinese hint in status bar"""
+-        current = self.cmd_var.get().strip().lower()
+-        if not current:
+-            return "break"
+-        # Build matches with Chinese descriptions
+-        quick_map = {cmd: label for label, cmd, _ in QUICK_COMMANDS}
+-        quick_cmds = [(cmd, label) for label, cmd, _ in QUICK_COMMANDS]
+-        # Deduplicate
+-        seen = set()
+-        unique = []
+-        for cmd, label in quick_cmds:
+-            if cmd not in seen:
+-                seen.add(cmd)
+-                unique.append((cmd, label))
+-        # Add history items
+-        history = self.gui_client._config.get("history", [])
+-        for cmd in history:
+-            if cmd not in seen:
+-                seen.add(cmd)
+-                unique.append((cmd, ""))
+-        # Filter
+-        tab_filter = self.gui_client._config.get("_tab_filter", "")
+-        if tab_filter != current:
+-            matches = [(cmd, label) for cmd, label in unique if cmd.lower().startswith(current)]
+-            self.gui_client._config["_tab_matches"] = matches
+-            self.gui_client._config["_tab_idx"] = 0
+-        else:
+-            matches = self.gui_client._config.get("_tab_matches", [])
+-        tab_idx = self.gui_client._config.get("_tab_idx", 0)
+-        if matches:
+-            idx = tab_idx % len(matches)
+-            cmd, label = matches[idx]
+-            # Only set the command text (clean, no Chinese)
+-            self.cmd_var.set(cmd)
+-            self.cmd_entry.icursor(tk.END)
+-            # Show Chinese hint in status bar
+-            if label:
+-                self.hint.configure(text=f"Tab: {cmd}  —  {label}  ·  Enter 执行")
+-            else:
+-                self.hint.configure(text=f"Tab: {cmd}  ·  Enter 执行")
+-            self.gui_client._config["_tab_idx"] = idx + 1
+-            self.gui_client._config["_tab_filter"] = current
+-        return "break"
+-
+-
+-    def _on_history_up(self, _evt=None):
+-        h = self.gui_client._config.get("history", [])
+-        if not h:
+-            return "break"
+-        idx = self.gui_client._config.get("_hist_idx")
+-        if idx is None:
+-            idx = len(h)
+-        idx = max(0, idx - 1)
+-        self.gui_client._config["_hist_idx"] = idx
+-        self.cmd_var.set(h[idx])
+-        return "break"
+-
+-    def _on_history_down(self, _evt=None):
+-        h = self.gui_client._config.get("history", [])
+-        idx = self.gui_client._config.get("_hist_idx")
+-        if idx is None:
+-            return "break"
+-        idx = min(len(h), idx + 1)
+-        if idx >= len(h):
+-            self.gui_client._config["_hist_idx"] = None
+-            self.cmd_var.set("")
+-        else:
+-            self.gui_client._config["_hist_idx"] = idx
+-            self.cmd_var.set(h[idx])
+-        self.gui_client._config["_tab_idx"] = None
+-        self.gui_client._config["_tab_filter"] = ""
+-        return "break"
+-
+-
+-    def _on_key_press(self, _evt=None):
+-        """Clear tab state when user types a printable character"""
+-        if _evt and _evt.char and _evt.char.isprintable():
+-            self.gui_client._config["_tab_idx"] = 0
+-            self.gui_client._config["_tab_filter"] = ""
+-
+-    def _on_cmd_type(self, _evt=None):
+-        """Reset hint when user types (but not during tab completion)"""
+-        # Don't reset if we're in the middle of tab cycling
+-        if self.gui_client._config.get("_tab_idx", 0) > 0:
+-            return
+-        self.hint.configure(text="Enter 执行 · ↑↓ 历史 · Ctrl+L 清屏 · F5 保存")
+-
+-    def _on_run(self, _evt=None):
+-        self.hint.configure(text="Enter 执行 · ↑↓ 历史 · Ctrl+L 清屏 · F5 保存")
+-        cmd = self.cmd_var.get().strip()
+-        if not cmd:
+-            return "break"
+-        self.cmd_var.set("")
+-        if not self.gui_client.is_connected:
+-            self._append("system", "[未连接] ", dim=True)
+-        history = self.gui_client._config.setdefault("history", [])
+-        if not history or history[-1] != cmd:
+-            history.append(cmd)
+-            if len(history) > 200:
+-                del history[: len(history) - 200]
+-            self._refresh_history()
+-            save_config(self.gui_client._config)
+-        self.gui_client._config["_hist_idx"] = None
+-        self.gui_client._config["_tab_idx"] = None
+-        self.gui_client._config["_tab_filter"] = ""
+-        self._append("prompt", f"$ {cmd}\n")
+-        if self.gui_client.is_connected:
+-            self.gui_client.run(cmd)
+-        return "break"
+-
+-    def _refresh_history(self):
+-        self.history_list.delete(0, tk.END)
+-        for h in self.gui_client._config.get("history", []):
+-            self.history_list.insert(tk.END, h)
+-
+-    def _save_host(self, i, n, a, p):
+-        h = self.gui_client._config["hosts"][i]
+-        h["name"] = n.get().strip() or h["name"]
+-        h["addr"] = a.get().strip() or h["addr"]
+-        h["psk"] = p.get().strip() or h["psk"]
+-        self.host_combo.configure(values=self._host_names())
+-        if self.host_var.get() == h["name"]:
+-            self._update_status()
+-        save_config(self.gui_client._config)
+-
+-    def _remove_host(self, i):
+-        hosts = self.gui_client._config["hosts"]
+-        if len(hosts) <= 1:
+-            return
+-        del hosts[i]
+-        active = self.gui_client._config.get("active", 0)
+-        if active >= len(hosts):
+-            self.gui_client._config["active"] = len(hosts) - 1
+-        self.host_combo.configure(values=self._host_names())
+-        if hosts:
+-            self.host_var.set(hosts[self.gui_client._config["active"]]["name"])
+-        self._render_hosts()
+-        self._save_config()
+-
+-    def _add_host(self):
+-        n = len(self.gui_client._config["hosts"]) + 1
+-        self.gui_client._config["hosts"].append({
+-            "name": f"主机{n}",
+-            "addr": "127.0.0.1:9876",
+-            "psk": "",
+-        })
+-        self.host_combo.configure(values=self._host_names())
+-        self._render_hosts()
+-        self._save_config()
+-
+-    def _save_config(self):
+-        save_config(self.gui_client._config)
+-        self.addr_status.configure(text=f"  已保存配置  ·  {_config_path()}")
+-
+-    def _clear_output(self):
+-        self.output.configure(state=tk.NORMAL)
+-        self.output.delete("1.0", tk.END)
+-        self.output.configure(state=tk.DISABLED)
+-
+-    def _on_copy(self, _evt=None):
+-        """Copy selected text from the output terminal"""
+-        try:
+-            sel = self.output.tag_ranges("sel")
+-            if sel:
+-                text = self.output.get(sel[0], sel[1])
+-                self.clipboard_clear()
+-                self.clipboard_append(text)
+-        except tk.TclError:
+-            pass
+-        return "break"
+-
+-    def _on_select_all(self, _evt=None):
+-        """Select all text in the output terminal"""
+-        self.output.configure(state=tk.NORMAL)
+-        self.output.tag_add("sel", "1.0", tk.END)
+-        self.output.configure(state=tk.DISABLED)
+-        return "break"
+-
+-    def _show_context_menu(self, event):
+-        """Show right-click menu on output terminal"""
+-        self.output.configure(state=tk.NORMAL)
+-        menu = tk.Menu(self, tearoff=0, bg=BG_PANEL, fg=FG, activebackground=BG_BTN_HI)
+-        # Check if there is a selection
+-        try:
+-            sel = self.output.tag_ranges("sel")
+-            if sel:
+-                menu.add_command(label="复制 (Ctrl+C)", command=self._on_copy)
+-                menu.add_separator()
+-            menu.add_command(label="全选 (Ctrl+A)", command=self._on_select_all)
+-        except tk.TclError:
+-            menu.add_command(label="全选 (Ctrl+A)", command=self._on_select_all)
+-        menu.tk_popup(event.x_root, event.y_root)
+-        self.output.configure(state=tk.DISABLED)
+-        return "break"
+-
+-    def _set_initial_sash(self):
+-        """Set initial sash position for better layout"""
+-        try:
+-            w = self.winfo_width()
+-            # Left panel gets about 25% of width
+-            left_w = max(200, int(w * 0.25))
+-            main.sashpos(0, left_w)
+-        except Exception:
+-            pass
+-
+-    def _update_output_height(self, total_h):
+-        """Adjust the terminal output area to fit better"""
+-        # Set a reasonable minimum visible area for output
+-        # Show at least 20 lines, but don't exceed available space
+-        min_lines = max(20, int(total_h / 16))  # ~16px per line
+-        max_lines = min(min_lines, 100)  # Cap at 100 lines
+-        # Update the output widget configuration
+-        self.output.configure(height=max_lines)
+-
+-    def _block_text_input(self, _evt):
+-        return "break"
+-
+-    def _on_event(self, ev):
+-        self.after(0, lambda: self._handle_event(ev))
+-
+-    def _handle_event(self, ev):
+-        t = ev.get("type")
+-        if t == "chunk":
+-            data = ev["data"]
+-            try:
+-                text = data.decode("utf-8", errors="replace")
+-            except Exception:
+-                text = str(data)
+-            tag = "stderr" if ev.get("stream") == 1 else "stdout"
+-            self._append(tag, text)
+-        elif t == "started":
+-            self._append("system", "[started]\n")
+-        elif t == "done":
+-            exit_code = ev.get("exit")
+-            self._append("system", f"[done] 退出码 = {exit_code!r}\n", hi=True)
+-        elif t == "status":
+-            self._append("system", f"[{ev.get('text','')}]\n")
+-            if "error" in ev and ev.get("error"):
+-                self.status_text.configure(text=ev.get("text", ""), foreground=ACCENT_ERR)
+-        self._update_status()
+-
+-    def _append(self, tag, text, dim=False, hi=False):
+-        if dim:
+-            tag = "dim"
+-        self.output.configure(state=tk.NORMAL)
+-        if hi:
+-            end_nl = ""
+-            if text.endswith("\n"):
+-                end_nl = "\n"
+-                text = text[:-1]
+-            self.output.insert(tk.END, text, ("hi",))
+-            self.output.insert(tk.END, end_nl, ())
+-        else:
+-            self.output.insert(tk.END, text, (tag,))
+-        self.output.configure(state=tk.DISABLED)
+-        if self.autoscroll_var.get():
+-            self.output.see(tk.END)
+-
+-    def _tick(self):
+-        self._update_status()
+-        self.after(500, self._tick)
+-
+-    def _on_resize(self, _evt=None):
+-        if self._reflow_scheduled:
+-            return
+-        self._reflow_scheduled = True
+-        self.after(120, self._reflow)
+-
+-    def _reflow(self):
+-        self._reflow_scheduled = False
+-        try:
+-            side_w = self.quick_container.winfo_width()
+-            total_h = self.winfo_height()
+-        except tk.TclError:
+-            return
+-        if side_w <= 0:
+-            cols = 1
+-        else:
+-            cols = max(1, side_w // 130)
+-            cols = min(cols, len(QUICK_COMMANDS))
+-        self._reflow_quick(cols)
+-        # Set terminal output to show more lines by default
+-        if total_h > 0:
+-            self._update_output_height(total_h)
+-
+-
+-def main():
+-    app = App()
+-    app.mainloop()
+-    return 0
+-
+-
+-if __name__ == "__main__":
+-    sys.exit(main())
+-
++#!/usr/bin/env python3
++# lan-link desktop GUI client (Codex-style)
++# Cross-platform standalone desktop app using tkinter (Python stdlib).
++# Reuses LanLinkClient from client_win.py for the wire protocol.
++# Run:   python client_gui.py
++# Package: pyinstaller --noconfirm --noconsole --onefile -n lan-link-gui client_gui.py
++
++import json
++import os
++import secrets
++import sys
++import threading
++import tkinter as tk
++from tkinter import messagebox
++from tkinter import ttk
++
++from client_win import LanLinkClient
++import ctypes
++
++def _hide_console():
++    """Hide console window - called after tkinter init."""
++    try:
++        _hwnd = ctypes.windll.kernel32.GetConsoleWindow()
++        if _hwnd:
++            ctypes.windll.user32.ShowWindow(_hwnd, 0)  # SW_HIDE
++    except Exception:
++        pass
++
++APP_NAME = "lan-link 远程命令"
++
++BG          = "#13151a"
++BG_PANEL    = "#1a1d23"
++BG_INPUT    = "#0f1116"
++BG_BTN      = "#242830"
++BG_BTN_HI   = "#2f3540"
++FG          = "#e8eaed"
++FG_DIM      = "#8b95a5"
++FG_LINK     = "#6cb4ee"
++ACCENT      = "#4ec763"
++ACCENT_WARN = "#e0a030"
++ACCENT_ERR  = "#f06050"
++BORDER      = "#3a4050"
++
++FONT_FAMILY = ("Cascadia Mono", "Consolas", "Menlo", "DejaVu Sans Mono")
++FONT_UI     = ("Segoe UI", "Microsoft YaHei UI", "PingFang SC", "Sans", 10)
++FONT_MONO   = (FONT_FAMILY[0], 10)
++FONT_MONO_S = (FONT_FAMILY[0], 9)
++
++
++def _config_path():
++    base = os.environ.get("APPDATA") or os.path.expanduser("~/.config")
++    if os.name == "nt" and not os.environ.get("APPDATA"):
++        base = os.path.expanduser("~")
++    d = os.path.join(base, "lan-link")
++    os.makedirs(d, exist_ok=True)
++    return os.path.join(d, "gui-config.json")
++
++
++def load_config():
++    p = _config_path()
++    if os.path.exists(p):
++        try:
++            with open(p, "r", encoding="utf-8") as f:
++                return json.load(f)
++        except Exception:
++            pass
++    return {
++        "hosts": [
++            {"name": "团子", "addr": "192.168.31.244:9876",
++             "psk": ""},
++            {"name": "本机", "addr": "127.0.0.1:9876",
++             "psk": ""},
++        ],
++        "active": 0,
++        "history": [],
++    }
++
++
++def save_config(cfg):
++    p = _config_path()
++    try:
++        with open(p, "w", encoding="utf-8") as f:
++            json.dump(cfg, f, indent=2)
++    except Exception as e:
++        print("[save_config err]", e, file=sys.stderr)
++
++
++QUICK_COMMANDS = [
++    ("系统信息", "uname -a",
++     "查看内核版本与系统架构"),
++    ("运行时间", "uptime",
++     "显示系统已运行时长和平均负载"),
++    ("当前用户", "whoami",
++     "显示当前登录用户名"),
++    ("网卡地址", "ip -4 addr show",
++     "列出所有 IPv4 地址与网卡状态"),
++    ("内存用量", "free -h",
++     "查看物理内存与交换分区用量"),
++    ("磁盘用量", "df -h /",
++     "查看根分区剩余空间"),
++    ("服务状态", "systemctl status lan-linkd --no-pager",
++     "查看 lan-link 守护进程状态"),
++    ("最近日志", "tail -n 50 /var/log/lan-linkd.log 2>/dev/null || journalctl -u lan-linkd -n 50 --no-pager",
++     "查看 lan-link 最近 50 行日志"),
++]
++
++
++class ToolTip:
++    def __init__(self, widget, text):
++        self.widget = widget
++        self.text = text
++        self.tip = None
++        widget.bind("<Enter>", self._show, add="+")
++        widget.bind("<Leave>", self._hide, add="+")
++
++    def _show(self, _evt=None):
++        if self.tip is not None or not self.text:
++            return
++        x = self.widget.winfo_rootx() + 18
++        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 6
++        self.tip = tw = tk.Toplevel(self.widget)
++        tw.wm_overrideredirect(True)
++        tw.wm_geometry(f"+{x}+{y}")
++        lbl = tk.Label(
++            tw, text=self.text, justify=tk.LEFT,
++            background="#ffffe0", foreground="#222",
++            relief=tk.SOLID,
++            font=("Microsoft YaHei", 9) if os.name == "nt" else ("Sans", 9),
++            padx=6, pady=3,
++        )
++        lbl.pack()
++
++    def _hide(self, _evt=None):
++        if self.tip is not None:
++            self.tip.destroy()
++            self.tip = None
++
++
++
++class GuiClient:
++    def __init__(self, on_event):
++        self.on_event = on_event
++        self._lock = threading.Lock()
++        self._client = None
++        self._config = load_config()
++        self._busy = False
++
++    @property
++    def active_host(self):
++        idx = self._config.get("active", 0)
++        if idx >= len(self._config["hosts"]):
++            idx = 0
++        return self._config["hosts"][idx]
++
++    def connect(self):
++        with self._lock:
++            if self._client is not None:
++                return
++            host = self.active_host
++            self._client = LanLinkClient(host["addr"], host["psk"], log=None, heartbeat_interval=0.0)
++            try:
++                self._client.connect()
++                self.on_event({"type": "status", "text": f"已连接到 {host['addr']}"})
++            except Exception as e:
++                self._client = None
++                self.on_event({"type": "status", "text": f"连接失败: {e}", "error": True})
++                raise
++
++    def disconnect(self):
++        with self._lock:
++            if self._client is not None:
++                try:
++                    self._client.stop()
++                except Exception:
++                    pass
++                self._client = None
++                self.on_event({"type": "status", "text": "已断开"})
++
++    @property
++    def is_connected(self):
++        return self._client is not None
++
++    def run(self, cmd):
++        if self._busy:
++            self.on_event({"type": "status", "text": "上一条命令还在执行中", "error": True})
++            return
++        with self._lock:
++            if self._client is None:
++                self.on_event({"type": "status", "text": "未连接", "error": True})
++                return
++            client = self._client
++        self._busy = True
++        self.on_event({"type": "started"})
++        threading.Thread(target=self._run_worker, args=(client, cmd), daemon=True).start()
++
++    def _run_worker(self, client, cmd):
++        try:
++            out, code = client.exec(cmd, timeout=300, on_chunk=self._on_chunk)
++            self.on_event({"type": "done", "exit": code})
++        except Exception as e:
++            self.on_event({"type": "status", "text": f"执行出错: {e}", "error": True})
++            self.on_event({"type": "done", "exit": None})
++        finally:
++            self._busy = False
++
++    def _on_chunk(self, stream, data):
++        self.on_event({"type": "chunk", "stream": stream, "data": data})
++
++
++
++class App(tk.Tk):
++    def __init__(self):
++        super().__init__()
++        _hide_console()
++        self.title(APP_NAME)
++        self.geometry("1040x720")
++        self.minsize(680, 420)
++        self.configure(bg=BG)
++        self._apply_theme()
++        self.gui_client = GuiClient(on_event=self._on_event)
++        self._build_layout()
++        self._update_status()
++        self.bind("<Configure>", self._on_resize)
++        self._reflow_scheduled = False
++        self.after(500, self._tick)
++
++    def _apply_theme(self):
++        style = ttk.Style(self)
++        style.theme_use("alt")
++        s = style
++        # Global dark background
++        s.configure(".", background=BG, foreground=FG, fieldbackground=BG_INPUT, bordercolor=BORDER)
++        s.configure("TFrame", background=BG)
++        s.configure("Panel.TFrame", background=BG_PANEL)
++        s.configure("TLabel", background=BG, foreground=FG, font="TkFixedFont")
++        s.configure("Panel.TLabel", background=BG_PANEL, foreground=FG, font="TkFixedFont")
++        s.configure("Dim.TLabel", background=BG, foreground=FG_DIM, font="TkFixedFont")
++        s.configure("Header.TLabel", background=BG, foreground=FG, font=(FONT_UI[0], 10, "bold"))
++        s.configure("PanelHeader.TLabel", background=BG_PANEL, foreground=FG, font=(FONT_UI[0], 9, "bold"))
++        s.configure("Status.TLabel", background=BG, foreground=FG_DIM, font="TkFixedFont")
++        # Quick-cmd buttons — use a named style AND explicitly pass foreground.
++        # clam theme strips foreground from the base style, so we rely on the map.
++        s.configure("Quick.TButton", background=BG_BTN, font="TkFixedFont",
++                    padding=(10, 8), borderwidth=0, relief=tk.FLAT)
++        s.map("Quick.TButton",
++              background=[("active", BG_BTN_HI), ("pressed", BG_BTN_HI), ("disabled", BG)],
++              foreground=[("active", FG), ("pressed", FG), ("!disabled", FG), ("disabled", FG_DIM)])
++        # Action / Accent buttons
++        s.configure("Accent.TButton", background=ACCENT, foreground="#0e1116",
++                    font=(FONT_UI[0], 10, "bold"), padding=(14, 8))
++        s.map("Accent.TButton", background=[("active", "#5dd875"), ("pressed", "#3ab055")])
++        s.configure("Danger.TButton", background=ACCENT_ERR, foreground="#fff",
++                    font="TkFixedFont", padding=(10, 6))
++        s.map("Danger.TButton", background=[("active", "#ff6259")])
++        s.configure("Ghost.TButton", background=BG_PANEL, foreground=FG,
++                    font="TkFixedFont", padding=(6, 4))
++        s.map("Ghost.TButton", background=[("active", BG_BTN_HI)])
++        s.configure("Clear.TButton", background=BG_BTN, foreground=FG_DIM,
++                    font="TkFixedFont", padding=(6, 4))
++        s.map("Clear.TButton", background=[("active", BG_BTN_HI)])
++        # Entry (use tk.Entry in layout for reliability)
++        s.configure("TEntry", fieldbackground=BG_INPUT, foreground=FG,
++                    bordercolor=BORDER, lightcolor=BORDER, darkcolor=BORDER, padding=(10, 7))
++        # Combobox
++        s.configure("TCombobox", fieldbackground=BG_INPUT, foreground=FG,
++                    background=BG_BTN, arrowcolor=FG, bordercolor=BORDER, padding=(6, 4))
++        s.map("TCombobox",
++              fieldbackground=[("readonly", BG_INPUT)],
++              foreground=[("readonly", FG)],
++              selectbackground=[("readonly", BG_INPUT)],
++              selectforeground=[("readonly", FG)])
++        # Checkbox
++        s.configure("TCheckbutton", background=BG, foreground=FG_DIM, font="TkFixedFont",
++                    focuscolor=BG, indicatorcolor=BG_BTN)
++        s.map("TCheckbutton", background=[("active", BG)],
++              indicatorcolor=[("selected", ACCENT), ("!selected", BG_BTN)])
++        # Paned / Scrollbar
++        s.configure("TPanedwindow", background=BG)
++        s.configure("Sash", background=BG, sashthickness=4)
++        s.configure("Vertical.TScrollbar", background=BG, troughcolor=BG,
++                    bordercolor=BG, arrowcolor=FG_DIM, width=10)
++        s.configure("Horizontal.TScrollbar", background=BG, troughcolor=BG,
++                    bordercolor=BG, arrowcolor=FG_DIM, width=10)
++        # Listbox (classic tk)
++        s.configure("TListbox", background=BG_INPUT, foreground=FG,
++                    selectbackground=BG_BTN_HI, selectforeground=FG,
++                    borderwidth=0, highlightthickness=0, font=FONT_MONO_S)
++        # Notebook
++        s.configure("TNotebook", background=BG, bordercolor=BORDER)
++        s.configure("TNotebook.Tab", background=BG_PANEL, foreground=FG,
++                    padding=(12, 6), font="TkFixedFont")
++        s.map("TNotebook.Tab",
++              background=[("selected", BG_BTN_HI)],
++              foreground=[("selected", FG)])
++
++
++
++    def _build_layout(self):
++        # ---- Top bar -----------------------------------------------------------
++        top = ttk.Frame(self, padding=(14, 10, 14, 10))
++        top.pack(side=tk.TOP, fill=tk.X)
++        ttk.Label(top, text=APP_NAME, style="Header.TLabel").pack(side=tk.LEFT)
++        # status dot
++        self.status_dot = tk.Canvas(top, width=8, height=8, bg=BG, highlightthickness=0)
++        self.status_dot.pack(side=tk.LEFT, padx=(12, 6))
++        self.status_dot_id = self.status_dot.create_oval(0, 0, 8, 8, fill=ACCENT_WARN, outline="")
++        self.status_text = ttk.Label(top, text="未连接", style="Status.TLabel")
++        self.status_text.pack(side=tk.LEFT)
++        # spacer
++        ttk.Frame(top).pack(side=tk.LEFT, fill=tk.X, expand=True)
++        # host selector
++        ttk.Label(top, text="主机", style="Dim.TLabel").pack(side=tk.LEFT, padx=(0, 6))
++        self.host_var = tk.StringVar()
++        self.host_combo = ttk.Combobox(
++            top, textvariable=self.host_var, state="readonly", width=14,
++            values=self._host_names(),
++        )
++        self.host_combo.pack(side=tk.LEFT, padx=(0, 10))
++        self.host_combo.bind("<<ComboboxSelected>>", self._on_host_change)
++        if self.gui_client._config["hosts"]:
++            self.host_var.set(
++                self.gui_client._config["hosts"][
++                    self.gui_client._config.get("active", 0)
++                ]["name"]
++            )
++        # connect button
++        self.connect_btn = ttk.Button(top, text="连接", style="Accent.TButton",
++                                      command=self._toggle_connection)
++        self.connect_btn.pack(side=tk.LEFT)
++        ttk.Separator(self, orient=tk.HORIZONTAL).pack(side=tk.TOP, fill=tk.X)
++
++        # ---- Main split (left + center) ----------------------------------------
++        self._main_paned = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
++        main = self._main_paned
++
++        # ---- Bottom command bar (pack BEFORE main so it gets space) ---------------
++        bottom = tk.Frame(self, bg=BG, bd=0)
++        bottom.pack(side=tk.BOTTOM, fill=tk.X, padx=14, pady=(10, 14))
++        bottom.columnconfigure(1, weight=1)
++
++        tk.Label(bottom, text="$", bg=BG, fg=ACCENT,
++                 font=(FONT_FAMILY[0], 12, "bold")).grid(row=0, column=0, padx=(0, 8))
++        self.cmd_var = tk.StringVar()
++        self.cmd_entry = tk.Entry(
++            bottom, textvariable=self.cmd_var,
++            background=BG_INPUT, foreground=FG, insertbackground=FG,
++            selectbackground=BG_BTN_HI, selectforeground=FG,
++            borderwidth=1, relief=tk.SOLID, highlightthickness=1,
++            highlightbackground=BORDER, highlightcolor=ACCENT,
++            font=FONT_MONO, width=40,
++        )
++        self.cmd_entry.grid(row=0, column=1, sticky="ew", padx=(0, 10))
++        self.cmd_entry.bind("<Return>", self._on_run)
++        self.cmd_entry.bind("<Tab>", self._on_tab_complete)
++        self.cmd_entry.bind("<Up>", self._on_history_up)
++        self.cmd_entry.bind("<Down>", self._on_history_down)
++        self.cmd_entry.focus_set()
++        self.cmd_entry.bind("<KeyRelease>", self._on_cmd_type)
++        # Clear tab state when user types printable characters
++        self.cmd_entry.bind("<KeyPress>", self._on_key_press)
++
++        btn_frame = ttk.Frame(bottom, style="TFrame")
++        btn_frame.grid(row=0, column=2, sticky="e")
++        btn_frame.columnconfigure(0, weight=1)
++
++        self.run_btn = tk.Button(btn_frame, text="执行", bg=ACCENT, fg="#0e1116",
++                                 activebackground="#4ec763", font=(FONT_UI[0], 10, "bold"),
++                                 borderwidth=0, cursor="hand2",
++                                 command=self._on_run)
++        self.run_btn.pack(side=tk.LEFT, padx=(0, 6))
++
++        self.autoscroll_var = tk.BooleanVar(value=True)
++        tk.Checkbutton(btn_frame, text="自动滚动", variable=self.autoscroll_var,
++                       bg=BG, fg=FG_DIM, selectcolor=ACCENT,
++                       activebackground=BG, activeforeground=FG_DIM,
++                       font="TkFixedFont", borderwidth=0).pack(side=tk.LEFT, padx=(4, 0))
++
++        tk.Button(btn_frame, text="清屏", bg=BG_BTN, fg=FG_DIM,
++                  activebackground=BG_BTN_HI, font="TkFixedFont",
++                  borderwidth=0, cursor="hand2",
++                  command=self._clear_output).pack(side=tk.LEFT, padx=(6, 0))
++
++        # Status bar
++        sep = ttk.Separator(self, orient=tk.HORIZONTAL)
++        sep.pack(side=tk.BOTTOM, fill=tk.X)
++        status_bar = ttk.Frame(self, padding=(12, 4))
++        status_bar.pack(side=tk.BOTTOM, fill=tk.X)
++        self.addr_status = ttk.Label(status_bar, text="", style="Status.TLabel")
++        self.addr_status.pack(side=tk.LEFT)
++        ttk.Frame(status_bar).pack(side=tk.LEFT, fill=tk.X, expand=True)
++        self.hint = ttk.Label(status_bar,
++            text="Enter 执行 · ↑↓ 历史 · Ctrl+L 清屏 · F5 保存",
++            style="Status.TLabel")
++        self.hint.pack(side=tk.RIGHT)
++        self.bind_all("<Control-l>", lambda e: self._clear_output())
++        self.bind_all("<F5>", lambda e: self._save_config())
++        # Set initial sash position
++        self.after(100, self._set_initial_sash)
++
++        # Main area (packs last, fills remaining space)
++        main.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
++
++        # Left panel
++        left = ttk.Frame(main, style="Panel.TFrame", padding=(14, 14, 14, 14))
++        main.add(left, weight=1)
++        left.columnconfigure(0, weight=1)
++
++        # --- Quick commands ---
++        ttk.Label(left, text="常用命令", style="PanelHeader.TLabel").grid(
++            row=0, column=0, sticky=tk.W, pady=(0, 8))
++        self.quick_container = ttk.Frame(left, style="Panel.TFrame")
++        self.quick_container.grid(row=1, column=0, sticky="ew")
++        self.quick_container.columnconfigure(0, weight=1)
++        self._quick_cols = 1
++        self._render_quick_commands()
++
++        # --- Separator ---
++        ttk.Separator(left, orient=tk.HORIZONTAL).grid(
++            row=2, column=0, sticky="ew", pady=(14, 10))
++
++        # --- History ---
++        hist_hdr = ttk.Frame(left, style="Panel.TFrame")
++        hist_hdr.grid(row=3, column=0, sticky="ew", pady=(0, 4))
++        hist_hdr.columnconfigure(0, weight=1)
++        ttk.Label(hist_hdr, text="历史", style="PanelHeader.TLabel").grid(row=0, column=0, sticky=tk.W)
++        ttk.Button(hist_hdr, text="清空", style="Ghost.TButton",
++                   command=self._clear_history).grid(row=0, column=1, sticky=tk.E)
++        self.history_list = tk.Listbox(
++            left, height=10, exportselection=False, activestyle="none",
++            background=BG_INPUT, foreground=FG,
++            selectbackground=BG_BTN_HI, selectforeground=FG,
++            borderwidth=1, highlightthickness=0,
++            relief=tk.SOLID,
++            font=FONT_MONO_S,
++        )
++        self.history_list.grid(row=4, column=0, sticky="nsew")
++        left.rowconfigure(4, weight=1)
++        self.history_list.bind("<<ListboxSelect>>", self._on_history_pick)
++        self.history_list.config(borderwidth=1, highlightthickness=0,
++                                 relief=tk.SOLID)
++
++        # --- Separator ---
++        ttk.Separator(left, orient=tk.HORIZONTAL).grid(
++            row=5, column=0, sticky="ew", pady=(14, 10))
++
++        # --- Hosts editor ---
++        hosts_hdr = ttk.Frame(left, style="Panel.TFrame")
++        hosts_hdr.grid(row=6, column=0, sticky="ew", pady=(0, 4))
++        hosts_hdr.columnconfigure(0, weight=1)
++        ttk.Label(hosts_hdr, text="主机", style="PanelHeader.TLabel").grid(row=0, column=0, sticky=tk.W)
++        ttk.Button(hosts_hdr, text="+ 添加", style="Ghost.TButton",
++                   command=self._add_host).grid(row=0, column=1, sticky=tk.E)
++        self.hosts_box = ttk.Frame(left, style="Panel.TFrame")
++        self.hosts_box.grid(row=7, column=0, sticky="ew")
++        self.hosts_box.columnconfigure(0, weight=1)
++        self._render_hosts()
++
++        # ---- Center terminal ---------------------------------------------------
++        # Center terminal frame
++        center = ttk.Frame(main, style="TFrame")
++        main.add(center, weight=4)
++        # term_frame fills the entire PanedWindow pane
++        term_frame = ttk.Frame(center, style="TFrame")
++        term_frame.pack(fill=tk.BOTH, expand=True)
++
++        self.output = tk.Text(
++            term_frame, wrap=tk.NONE,
++            background=BG_INPUT, foreground=FG,
++            insertbackground=FG, selectbackground=BG_BTN_HI, selectforeground=FG,
++            font=FONT_MONO, padx=14, pady=10, relief=tk.FLAT,
++            borderwidth=1, highlightthickness=1,
++            highlightbackground=BORDER, highlightcolor=BORDER,
++            undo=False, takefocus=False,
++        )
++        self.output.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
++        self.output.tag_configure("stdout", foreground=FG)
++        self.output.tag_configure("stderr", foreground=ACCENT_ERR)
++        self.output.tag_configure("system", foreground=FG_LINK)
++        self.output.tag_configure("prompt", foreground=ACCENT)
++        self.output.tag_configure("dim",    foreground=FG_DIM)
++        self.output.tag_configure("hi",     foreground=FG, background="#1a212b")
++        # scrollbars — dark-themed, placed alongside the Text widget
++        ysb = ttk.Scrollbar(term_frame, orient=tk.VERTICAL, command=self.output.yview)
++        ysb.pack(side=tk.RIGHT, fill=tk.Y)
++        xsb = ttk.Scrollbar(term_frame, orient=tk.HORIZONTAL, command=self.output.xview)
++        xsb.pack(side=tk.BOTTOM, fill=tk.X)
++        self.output.configure(yscrollcommand=ysb.set, xscrollcommand=xsb.set)
++        self.output.bind("<Key>", self._block_text_input)
++        self.output.bind("<Control-c>", self._on_copy)
++        self.output.bind("<Control-C>", self._on_copy)
++        self.output.bind("<Control-a>", self._on_select_all)
++        self.output.bind("<Control-A>", self._on_select_all)
++        # Right-click context menu
++        self.output.bind("<Button-3>", self._show_context_menu)
++        self.output.configure(state=tk.DISABLED)
++
++        
++
++
++
++    # ---- render helpers ----
++    def _render_quick_commands(self):
++        for w in self.quick_container.winfo_children():
++            w.destroy()
++        for i, (label, cmd, tip) in enumerate(QUICK_COMMANDS):
++            r, c = divmod(i, self._quick_cols)
++            b = ttk.Button(
++                self.quick_container, text=label,
++                style="Quick.TButton",
++                command=lambda v=cmd: self._fill_command(v),
++            )
++            b.grid(row=r, column=c, sticky="ew",
++                   padx=(0 if c == 0 else 4, 0), pady=2, ipadx=6, ipady=4)
++            ToolTip(b, tip)
++
++    def _reflow_quick(self, cols):
++        if cols == self._quick_cols:
++            return
++        self._quick_cols = cols
++        for w in self.quick_container.winfo_children():
++            w.destroy()
++        for c in range(cols):
++            self.quick_container.columnconfigure(c, weight=1)
++        for i, (label, cmd, tip) in enumerate(QUICK_COMMANDS):
++            r, c = divmod(i, cols)
++            b = ttk.Button(
++                self.quick_container, text=label,
++                style="Quick.TButton",
++                command=lambda v=cmd: self._fill_command(v),
++            )
++            b.grid(row=r, column=c, sticky="ew",
++                   padx=(0 if c == 0 else 4, 0), pady=2, ipadx=6, ipady=4)
++            ToolTip(b, tip)
++
++    def _render_hosts(self):
++        for w in self.hosts_box.winfo_children():
++            w.destroy()
++        hosts = self.gui_client._config["hosts"]
++        for i, h in enumerate(hosts):
++            row = ttk.Frame(self.hosts_box, style="Panel.TFrame")
++            row.pack(fill=tk.X, pady=(0, 8))
++            row.columnconfigure(1, weight=1)
++            ttk.Label(row, text="名字", style="Panel.TLabel").grid(row=0, column=0, sticky=tk.W, pady=(0, 1))
++            ttk.Label(row, text="地址", style="Panel.TLabel").grid(row=1, column=0, sticky=tk.W, pady=(0, 1))
++            ttk.Label(row, text="PSK ", style="Panel.TLabel").grid(row=2, column=0, sticky=tk.W, pady=(0, 1))
++            nv = tk.StringVar(value=h["name"])
++            av = tk.StringVar(value=h["addr"])
++            pv = tk.StringVar(value=h["psk"])
++            tk.Entry(row, textvariable=nv,
++                     background=BG_INPUT, foreground=FG, insertbackground=FG,
++                     borderwidth=1, relief=tk.SOLID, highlightthickness=1,
++                     highlightbackground=BORDER, highlightcolor=ACCENT,
++                     font=FONT_MONO_S).grid(row=0, column=1, sticky="ew", padx=(8, 0), pady=(0, 1))
++            tk.Entry(row, textvariable=av,
++                     background=BG_INPUT, foreground=FG, insertbackground=FG,
++                     borderwidth=1, relief=tk.SOLID, highlightthickness=1,
++                     highlightbackground=BORDER, highlightcolor=ACCENT,
++                     font=FONT_MONO_S).grid(row=1, column=1, sticky="ew", padx=(8, 0), pady=(0, 1))
++            tk.Entry(row, textvariable=pv, show="*",
++                     background=BG_INPUT, foreground=FG, insertbackground=FG,
++                     borderwidth=1, relief=tk.SOLID, highlightthickness=1,
++                     highlightbackground=BORDER, highlightcolor=ACCENT,
++                     font=FONT_MONO_S).grid(row=2, column=1, sticky="ew", padx=(8, 0), pady=(0, 1))
++            btns = ttk.Frame(row, style="Panel.TFrame")
++            btns.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(4, 0))
++            ttk.Button(btns, text="保存", style="Ghost.TButton",
++                       command=lambda i=i, n=nv, a=av, p=pv: self._save_host(i, n, a, p)).pack(side=tk.LEFT)
++            if len(hosts) > 1:
++                ttk.Button(btns, text="删除", style="Ghost.TButton",
++                           command=lambda i=i: self._remove_host(i)).pack(side=tk.LEFT, padx=(6, 0))
++
++    # ---- callbacks ----
++    def _host_names(self):
++        return [h["name"] for h in self.gui_client._config["hosts"]]
++
++    def _on_host_change(self, _evt=None):
++        name = self.host_var.get()
++        for i, h in enumerate(self.gui_client._config["hosts"]):
++            if h["name"] == name:
++                self.gui_client._config["active"] = i
++                self._save_config()
++                break
++        self._update_status()
++
++    def _toggle_connection(self):
++        if self.gui_client.is_connected:
++            self.gui_client.disconnect()
++        else:
++            host = self.gui_client.active_host
++            if not host.get("psk", ""):
++                ret = messagebox.askyesno(
++                    title="PSK 未配置",
++                    message=(
++                        "主机「%s」未设置 PSK(预共享密钥)。\n\n"
++                        + "PSK 用于加密通信，两端需使用相同的 64 位十六进制密钥。\n\n"
++                        + "是否自动生成随机 PSK？\n"
++                        + "(选「是」自动生成，选「否」手动输入)"
++                        % host["name"]
++                    )
++                )
++                if ret:
++                    host["psk"] = secrets.token_hex(32)
++                    self._render_hosts()
++                else:
++                    return
++            try:
++                self.gui_client.connect()
++            except Exception:
++                import traceback
++                tb = traceback.format_exc()
++                messagebox.showerror("连接失败", f"无法连接到 {host['name']} ({host['addr']})\n\n{tb}")
++        self._update_status()
++
++    def _update_status(self):
++        host = self.gui_client.active_host
++        self.addr_status.configure(text=f"  {host['name']}  ·  {host['addr']}")
++        if self.gui_client.is_connected:
++            self.status_dot.itemconfigure(self.status_dot_id, fill=ACCENT)
++            self.status_text.configure(text="已连接", foreground=ACCENT)
++            self.connect_btn.configure(text="断开", style="Danger.TButton")
++        else:
++            self.status_dot.itemconfigure(self.status_dot_id, fill=ACCENT_WARN)
++            self.status_text.configure(text="未连接", foreground=ACCENT_WARN)
++            self.connect_btn.configure(text="连接", style="Accent.TButton")
++
++    def _fill_command(self, cmd):
++        self.cmd_var.set(cmd)
++        self.cmd_entry.focus_set()
++        self.cmd_entry.bind("<KeyRelease>", self._on_cmd_type)
++
++    def _on_history_pick(self, _evt=None):
++        sel = self.history_list.curselection()
++        if sel:
++            self._fill_command(self.history_list.get(sel[0]))
++
++    def _clear_history(self):
++        self.gui_client._config["history"] = []
++        self._refresh_history()
++        self._save_config()
++
++    def _on_tab_complete(self, _evt=None):
++        """Tab key completion: show command with Chinese hint in status bar"""
++        current = self.cmd_var.get().strip().lower()
++        if not current:
++            return "break"
++        # Build matches with Chinese descriptions
++        quick_map = {cmd: label for label, cmd, _ in QUICK_COMMANDS}
++        quick_cmds = [(cmd, label) for label, cmd, _ in QUICK_COMMANDS]
++        # Deduplicate
++        seen = set()
++        unique = []
++        for cmd, label in quick_cmds:
++            if cmd not in seen:
++                seen.add(cmd)
++                unique.append((cmd, label))
++        # Add history items
++        history = self.gui_client._config.get("history", [])
++        for cmd in history:
++            if cmd not in seen:
++                seen.add(cmd)
++                unique.append((cmd, ""))
++        # Filter
++        tab_filter = self.gui_client._config.get("_tab_filter", "")
++        if tab_filter != current:
++            matches = [(cmd, label) for cmd, label in unique if cmd.lower().startswith(current)]
++            self.gui_client._config["_tab_matches"] = matches
++            self.gui_client._config["_tab_idx"] = 0
++        else:
++            matches = self.gui_client._config.get("_tab_matches", [])
++        tab_idx = self.gui_client._config.get("_tab_idx", 0)
++        if matches:
++            idx = tab_idx % len(matches)
++            cmd, label = matches[idx]
++            # Only set the command text (clean, no Chinese)
++            self.cmd_var.set(cmd)
++            self.cmd_entry.icursor(tk.END)
++            # Show Chinese hint in status bar
++            if label:
++                self.hint.configure(text=f"Tab: {cmd}  —  {label}  ·  Enter 执行")
++            else:
++                self.hint.configure(text=f"Tab: {cmd}  ·  Enter 执行")
++            self.gui_client._config["_tab_idx"] = idx + 1
++            self.gui_client._config["_tab_filter"] = current
++        return "break"
++
++
++    def _on_history_up(self, _evt=None):
++        h = self.gui_client._config.get("history", [])
++        if not h:
++            return "break"
++        idx = self.gui_client._config.get("_hist_idx")
++        if idx is None:
++            idx = len(h)
++        idx = max(0, idx - 1)
++        self.gui_client._config["_hist_idx"] = idx
++        self.cmd_var.set(h[idx])
++        return "break"
++
++    def _on_history_down(self, _evt=None):
++        h = self.gui_client._config.get("history", [])
++        idx = self.gui_client._config.get("_hist_idx")
++        if idx is None:
++            return "break"
++        idx = min(len(h), idx + 1)
++        if idx >= len(h):
++            self.gui_client._config["_hist_idx"] = None
++            self.cmd_var.set("")
++        else:
++            self.gui_client._config["_hist_idx"] = idx
++            self.cmd_var.set(h[idx])
++        self.gui_client._config["_tab_idx"] = None
++        self.gui_client._config["_tab_filter"] = ""
++        return "break"
++
++
++    def _on_key_press(self, _evt=None):
++        """Clear tab state when user types a printable character"""
++        if _evt and _evt.char and _evt.char.isprintable():
++            self.gui_client._config["_tab_idx"] = 0
++            self.gui_client._config["_tab_filter"] = ""
++
++    def _on_cmd_type(self, _evt=None):
++        """Reset hint when user types (but not during tab completion)"""
++        # Don't reset if we're in the middle of tab cycling
++        if self.gui_client._config.get("_tab_idx", 0) > 0:
++            return
++        self.hint.configure(text="Enter 执行 · ↑↓ 历史 · Ctrl+L 清屏 · F5 保存")
++
++    def _on_run(self, _evt=None):
++        self.hint.configure(text="Enter 执行 · ↑↓ 历史 · Ctrl+L 清屏 · F5 保存")
++        cmd = self.cmd_var.get().strip()
++        if not cmd:
++            return "break"
++        self.cmd_var.set("")
++        if not self.gui_client.is_connected:
++            self._append("system", "[未连接] ", dim=True)
++        history = self.gui_client._config.setdefault("history", [])
++        if not history or history[-1] != cmd:
++            history.append(cmd)
++            if len(history) > 200:
++                del history[: len(history) - 200]
++            self._refresh_history()
++            save_config(self.gui_client._config)
++        self.gui_client._config["_hist_idx"] = None
++        self.gui_client._config["_tab_idx"] = None
++        self.gui_client._config["_tab_filter"] = ""
++        self._append("prompt", f"$ {cmd}\n")
++        if self.gui_client.is_connected:
++            self.gui_client.run(cmd)
++        return "break"
++
++    def _refresh_history(self):
++        self.history_list.delete(0, tk.END)
++        for h in self.gui_client._config.get("history", []):
++            self.history_list.insert(tk.END, h)
++
++    def _save_host(self, i, n, a, p):
++        h = self.gui_client._config["hosts"][i]
++        h["name"] = n.get().strip() or h["name"]
++        h["addr"] = a.get().strip() or h["addr"]
++        h["psk"] = p.get().strip() or h["psk"]
++        self.host_combo.configure(values=self._host_names())
++        if self.host_var.get() == h["name"]:
++            self._update_status()
++        save_config(self.gui_client._config)
++
++    def _remove_host(self, i):
++        hosts = self.gui_client._config["hosts"]
++        if len(hosts) <= 1:
++            return
++        del hosts[i]
++        active = self.gui_client._config.get("active", 0)
++        if active >= len(hosts):
++            self.gui_client._config["active"] = len(hosts) - 1
++        self.host_combo.configure(values=self._host_names())
++        if hosts:
++            self.host_var.set(hosts[self.gui_client._config["active"]]["name"])
++        self._render_hosts()
++        self._save_config()
++
++    def _add_host(self):
++        n = len(self.gui_client._config["hosts"]) + 1
++        self.gui_client._config["hosts"].append({
++            "name": f"主机{n}",
++            "addr": "127.0.0.1:9876",
++            "psk": "",
++        })
++        self.host_combo.configure(values=self._host_names())
++        self._render_hosts()
++        self._save_config()
++
++    def _save_config(self):
++        save_config(self.gui_client._config)
++        self.addr_status.configure(text=f"  已保存配置  ·  {_config_path()}")
++
++    def _clear_output(self):
++        self.output.configure(state=tk.NORMAL)
++        self.output.delete("1.0", tk.END)
++        self.output.configure(state=tk.DISABLED)
++
++    def _on_copy(self, _evt=None):
++        """Copy selected text from the output terminal"""
++        try:
++            sel = self.output.tag_ranges("sel")
++            if sel:
++                text = self.output.get(sel[0], sel[1])
++                self.clipboard_clear()
++                self.clipboard_append(text)
++        except tk.TclError:
++            pass
++        return "break"
++
++    def _on_select_all(self, _evt=None):
++        """Select all text in the output terminal"""
++        self.output.configure(state=tk.NORMAL)
++        self.output.tag_add("sel", "1.0", tk.END)
++        self.output.configure(state=tk.DISABLED)
++        return "break"
++
++    def _show_context_menu(self, event):
++        """Show right-click menu on output terminal"""
++        self.output.configure(state=tk.NORMAL)
++        menu = tk.Menu(self, tearoff=0, bg=BG_PANEL, fg=FG, activebackground=BG_BTN_HI)
++        # Check if there is a selection
++        try:
++            sel = self.output.tag_ranges("sel")
++            if sel:
++                menu.add_command(label="复制 (Ctrl+C)", command=self._on_copy)
++                menu.add_separator()
++            menu.add_command(label="全选 (Ctrl+A)", command=self._on_select_all)
++        except tk.TclError:
++            menu.add_command(label="全选 (Ctrl+A)", command=self._on_select_all)
++        menu.tk_popup(event.x_root, event.y_root)
++        self.output.configure(state=tk.DISABLED)
++        return "break"
++
++    def _set_initial_sash(self):
++        """Set initial sash position for better layout"""
++        try:
++            w = self.winfo_width()
++            # Left panel gets about 25% of width
++            left_w = max(200, int(w * 0.25))
++            main.sashpos(0, left_w)
++        except Exception:
++            pass
++
++    def _update_output_height(self, total_h):
++        """Adjust the terminal output area to fit better"""
++        # Set a reasonable minimum visible area for output
++        # Show at least 20 lines, but don't exceed available space
++        min_lines = max(20, int(total_h / 16))  # ~16px per line
++        max_lines = min(min_lines, 100)  # Cap at 100 lines
++        # Update the output widget configuration
++        self.output.configure(height=max_lines)
++
++    def _block_text_input(self, _evt):
++        return "break"
++
++    def _on_event(self, ev):
++        self.after(0, lambda: self._handle_event(ev))
++
++    def _handle_event(self, ev):
++        t = ev.get("type")
++        if t == "chunk":
++            data = ev["data"]
++            try:
++                text = data.decode("utf-8", errors="replace")
++            except Exception:
++                text = str(data)
++            tag = "stderr" if ev.get("stream") == 1 else "stdout"
++            self._append(tag, text)
++        elif t == "started":
++            self._append("system", "[started]\n")
++        elif t == "done":
++            exit_code = ev.get("exit")
++            self._append("system", f"[done] 退出码 = {exit_code!r}\n", hi=True)
++        elif t == "status":
++            self._append("system", f"[{ev.get('text','')}]\n")
++            if "error" in ev and ev.get("error"):
++                self.status_text.configure(text=ev.get("text", ""), foreground=ACCENT_ERR)
++        self._update_status()
++
++    def _append(self, tag, text, dim=False, hi=False):
++        if dim:
++            tag = "dim"
++        self.output.configure(state=tk.NORMAL)
++        if hi:
++            end_nl = ""
++            if text.endswith("\n"):
++                end_nl = "\n"
++                text = text[:-1]
++            self.output.insert(tk.END, text, ("hi",))
++            self.output.insert(tk.END, end_nl, ())
++        else:
++            self.output.insert(tk.END, text, (tag,))
++        self.output.configure(state=tk.DISABLED)
++        if self.autoscroll_var.get():
++            self.output.see(tk.END)
++
++    def _tick(self):
++        self._update_status()
++        self.after(500, self._tick)
++
++    def _on_resize(self, _evt=None):
++        if self._reflow_scheduled:
++            return
++        self._reflow_scheduled = True
++        self.after(120, self._reflow)
++
++    def _reflow(self):
++        self._reflow_scheduled = False
++        try:
++            side_w = self.quick_container.winfo_width()
++            total_h = self.winfo_height()
++        except tk.TclError:
++            return
++        if side_w <= 0:
++            cols = 1
++        else:
++            cols = max(1, side_w // 130)
++            cols = min(cols, len(QUICK_COMMANDS))
++        self._reflow_quick(cols)
++        # Set terminal output to show more lines by default
++        if total_h > 0:
++            self._update_output_height(total_h)
++
++
++def main():
++    app = App()
++    app.mainloop()
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
++
+diff --git a/client_win.py b/client_win.py
+index ae49cd2..16778fb 100644
+--- a/client_win.py
++++ b/client_win.py
+@@ -201,16 +201,16 @@ def input_key(down, scancode, vk, modifiers=0):
+ 
+ def input_mouse_move(dx, dy):
+     # enum tag u32 + struct { i32 dx, i32 dy, bool absolute }
+-    return struct.pack("<I", MOUSE_EV_MOVE) + struct.pack("<iiB", dx, dy, 0) + b"\x00\x00\x00"  # 4B padding to align to 4
++    return struct.pack("<I", MOUSE_EV_MOVE) + struct.pack("<iiB", dx, dy, 0)
+ 
+ 
+ def input_mouse_button(button, down):
+-    # enum tag u32 + struct { MouseButton(u8), bool(u8) } + padding
+-    return struct.pack("<I", MOUSE_EV_BUTTON) + struct.pack("<BB", button, 1 if down else 0) + b"\x00\x00"
++    # enum tag u32 + MouseButton enum tag u32 + bool down (1B)
++    return struct.pack("<IIB", MOUSE_EV_BUTTON, button, 1 if down else 0)
+ 
+ 
+ def input_mouse_wheel(delta, horizontal=False):
+-    return struct.pack("<I", MOUSE_EV_WHEEL) + struct.pack("<hB", delta, 1 if horizontal else 0) + b"\x00"
++    return struct.pack("<I", MOUSE_EV_WHEEL) + struct.pack("<hB", delta, 1 if horizontal else 0)
+ 
+ 
+ class LanLinkClient:
+diff --git a/crates/ctl/src/main.rs b/crates/ctl/src/main.rs
+index 2e1f4d7..472df78 100644
+--- a/crates/ctl/src/main.rs
++++ b/crates/ctl/src/main.rs
+@@ -298,7 +298,7 @@ enum MouseAction {
+ fn encode_control(conn_id: u64, psk: &Psk, seq: u32, msg: &ControlMsg) -> Vec<u8> {
+     let payload = bincode::serialize(msg).expect("serialize");
+     let nonce = crypto::make_nonce(conn_id, seq);
+-    let encrypted = crypto::encrypt(psk, &nonce, &payload);
++    let encrypted = crypto::encrypt(psk, &nonce, &payload).expect("encrypt");
+     encode_packet(conn_id, PacketType::Data, StreamId::Control as u16, seq, Flags::RELIABLE, &encrypted)
+ }
+ 
+diff --git a/crates/daemon/src/main.rs b/crates/daemon/src/main.rs
+index 1883f1c..7b0c423 100644
+--- a/crates/daemon/src/main.rs
++++ b/crates/daemon/src/main.rs
+@@ -247,9 +247,13 @@ async fn handle_packet_inner(
+             }
+         }
+         PacketType::Data => {
+-            // Only process Data on established connections
++            // Verify source IP matches connection
+             match connections.get(&conn_id) {
+-                Some(conn) if conn.state == ConnState::Established => {}
++                Some(conn) if conn.state == ConnState::Established && conn.peer == peer => {}
++                Some(conn) if conn.state == ConnState::Established && conn.peer != peer => {
++                    warn!("Data from wrong peer {} for conn {} (expected {}), dropping", peer, conn_id, conn.peer);
++                    return;
++                }
+                 _ => { warn!("Data on non-established conn {} from {}", conn_id, peer); return; }
+             }
+             let enc_start = HEADER_SIZE;
+@@ -281,7 +285,7 @@ async fn handle_packet_inner(
+         }
+         PacketType::Heartbeat => {
+             if let Some(conn) = connections.get_mut(&conn_id) {
+-                if conn.state != ConnState::Established {
++                if conn.state != ConnState::Established || conn.peer != peer {
+                     return;
+                 }
+                 conn.last_activity = Instant::now();
+@@ -413,9 +417,15 @@ async fn handle_control(
+             let _ = send_control(conn_id, peer, psk, next_seq(), &ControlMsg::HelloAck { version: PROTOCOL_VERSION, capabilities: vec!["exec".into(), "input".into()] }, &send_socket).await;
+         }
+         ControlMsg::NativeCmd { id, cmd } => {
+-            let (out, exit) = native_cmd::run_native_cmd(&cmd);
+-            let _ = send_control(conn_id, peer, psk, next_seq(), &ControlMsg::ExecChunk { id, stream: 0, data: out }, &send_socket).await;
+-            let _ = send_control(conn_id, peer, psk, next_seq(), &ControlMsg::ExecDone { id, exit_code: exit }, &send_socket).await;
++            let psk2 = *psk;
++            let sock2 = send_socket.clone();
++            let peer2 = peer;
++            // Run in blocking thread to not stall the async event loop
++            let (out, exit) = tokio::task::spawn_blocking(move || {
++                native_cmd::run_native_cmd(&cmd)
++            }).await.unwrap_or((b"NativeCmd: spawn_blocking failed\n".to_vec(), Some(1)));
++            let _ = send_control(conn_id, peer2, &psk2, next_seq(), &ControlMsg::ExecChunk { id, stream: 0, data: out }, &sock2).await;
++            let _ = send_control(conn_id, peer2, &psk2, next_seq(), &ControlMsg::ExecDone { id, exit_code: exit }, &sock2).await;
+         }
+ 
+         _ => debug!("Unhandled control: {:?}", msg),
+@@ -490,7 +500,10 @@ async fn send_control(conn_id: u64, peer: SocketAddr, psk: &Psk, seq: u64, msg:
+     let payload = bincode::serialize(msg).unwrap();
+     let seq32 = seq as u32;
+     let nonce = crypto::make_nonce(conn_id, seq32);
+-    let encrypted = crypto::encrypt(psk, &nonce, &payload);
++    let encrypted = match crypto::encrypt(psk, &nonce, &payload) {
++        Ok(e) => e,
++        Err(_) => { warn!("encrypt failed for conn {}", conn_id); return; }
++    };
+     let packet = Connection::build_encrypted_data(conn_id, StreamId::Control as u16, seq32, Flags::RELIABLE, &encrypted, nonce);
+     let _ = send_socket.send_to(&packet, peer).await;
+ }
+diff --git a/crates/daemon/src/native_cmd/exec.rs b/crates/daemon/src/native_cmd/exec.rs
+index a5c935b..a702b2d 100644
+--- a/crates/daemon/src/native_cmd/exec.rs
++++ b/crates/daemon/src/native_cmd/exec.rs
+@@ -44,6 +44,12 @@ pub fn cmd_sed(path: &str, pattern: &str, replacement: &str) -> (Vec<u8>, Option
+         return (b"sed: path must not contain '..'\n".to_vec(), Some(1));
+     }
+ 
++    // NOTE: TOCTOU race — the file is read and then written in two separate
++    // operations. A concurrent writer could modify the file between the read
++    // and the write, causing data loss or inconsistency. A production fix would
++    // use a rename+atomic-write pattern: write to a temp file, then rename over
++    // the original.
++
+     let new_content = match std::fs::read_to_string(path) {
+         Ok(c) => c.replace(pattern, replacement),
+         Err(e) => return (format!("read error: {}\n", e).into_bytes(), Some(1)),
+diff --git a/crates/daemon/src/native_cmd/fs.rs b/crates/daemon/src/native_cmd/fs.rs
+index d1d30c4..3f864ff 100644
+--- a/crates/daemon/src/native_cmd/fs.rs
++++ b/crates/daemon/src/native_cmd/fs.rs
+@@ -118,7 +118,8 @@ pub fn cmd_tail(path: &str, n: u32, follow: bool, follow_secs: u64) -> (Vec<u8>,
+     if follow {
+         let secs = if follow_secs > 0 { follow_secs } else { 1 };
+         let mut known_count = lines.len();
+-        loop {
++        let max_iter = if follow_secs > 0 { follow_secs / secs } else { 60 };
++        for _ in 0..max_iter {
+             std::thread::sleep(std::time::Duration::from_secs(secs));
+             if let Ok(new_c) = std::fs::read_to_string(path) {
+                 let new_lines: Vec<&str> = new_c.lines().collect();
+@@ -187,6 +188,7 @@ pub fn cmd_grep(
+     recursive: bool,
+     ln: bool,
+     cnt: bool,
++    maxdepth: u32,
+ ) -> (Vec<u8>, Option<i32>) {
+     if !recursive {
+         let c = match std::fs::read_to_string(path) {
+@@ -230,6 +232,7 @@ pub fn cmd_grep(
+         &mut total,
+         ln,
+         cnt,
++        maxdepth,
+     );
+ 
+     (
+@@ -242,14 +245,17 @@ pub fn cmd_grep(
+     )
+ }
+ 
+-pub fn grep_walk(p: &std::path::Path, pat: &str, out: &mut String, t: &mut usize, ln: bool, cnt: bool) {
+-    let mut stack = vec![p.to_path_buf()];
+-    while let Some(dir) = stack.pop() {
++pub fn grep_walk(p: &std::path::Path, pat: &str, out: &mut String, t: &mut usize, ln: bool, cnt: bool, max_depth: u32) {
++    let mut stack = vec![(p.to_path_buf(), 0u32)];
++    while let Some((dir, depth)) = stack.pop() {
++        if depth >= max_depth {
++            continue;
++        }
+         if let Ok(entries) = std::fs::read_dir(&dir) {
+             for entry in entries.filter_map(|e| e.ok()) {
+                 let path = entry.path();
+                 if path.is_dir() {
+-                    stack.push(path);
++                    stack.push((path, depth + 1));
+                 } else if let Ok(c) = std::fs::read_to_string(&path) {
+                     let mut fm = 0usize;
+                     for (i, l) in c.lines().enumerate() {
+diff --git a/crates/daemon/src/native_cmd/mod.rs b/crates/daemon/src/native_cmd/mod.rs
+index 02cdd34..5415842 100644
+--- a/crates/daemon/src/native_cmd/mod.rs
++++ b/crates/daemon/src/native_cmd/mod.rs
+@@ -37,7 +37,7 @@ pub fn run_native_cmd(cmd: &NativeCmdType) -> (Vec<u8>, Option<i32>) {
+         NativeCmdType::Tail { path, lines, follow, follow_secs } => fs::cmd_tail(path, *lines, *follow, *follow_secs),
+         NativeCmdType::Stat { path } => fs::cmd_stat(path),
+         NativeCmdType::Grep { pattern, path, recursive, line_number, count } => {
+-            fs::cmd_grep(pattern, path, *recursive, *line_number, *count)
++            fs::cmd_grep(pattern, path, *recursive, *line_number, *count, 10)
+         }
+         NativeCmdType::Find { path, name, type_, maxdepth } => {
+             fs::cmd_find(path, &name, &type_, *maxdepth)
+diff --git a/crates/daemon/src/native_cmd/system.rs b/crates/daemon/src/native_cmd/system.rs
+index 789d214..3542009 100644
+--- a/crates/daemon/src/native_cmd/system.rs
++++ b/crates/daemon/src/native_cmd/system.rs
+@@ -379,7 +379,19 @@ pub fn cmd_top_snapshot() -> (Vec<u8>, Option<i32>) {
+             cl.replace('\0', " ")
+         };
+ 
+-        let cpu_pct = cpu_jiffies / (uptime_secs * clk_tck) * 100.0;
++        // Read starttime from /proc/[pid]/stat (field 21, 0-indexed)
++        let proc_stat = read_proc(&format!("/proc/{}/stat", pid));
++        let starttime: f64 = proc_stat
++            .split_whitespace()
++            .nth(21)
++            .and_then(|v| v.parse::<f64>().ok())
++            .unwrap_or(0.0);
++        let proc_uptime = uptime_secs - starttime / clk_tck;
++        let cpu_pct = if proc_uptime > 0.0 {
++            cpu_jiffies / proc_uptime / clk_tck * 100.0
++        } else {
++            0.0
++        };
+         let mem_pct = if total_mem_kb > 0 {
+             (*rss as f64) / (total_mem_kb as f64 * 1024.0) * 100.0
+         } else {
+diff --git a/crates/gui/src/client.rs b/crates/gui/src/client.rs
+index a2dd477..f737d95 100644
+--- a/crates/gui/src/client.rs
++++ b/crates/gui/src/client.rs
+@@ -172,9 +172,9 @@ impl Connection {
+ 
+     pub async fn send_control(&mut self, msg: &ControlMsg) -> anyhow::Result<()> {
+         let payload = serialize(msg)?;
+-        let seq = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
++        let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
+         let nonce = crypto::make_nonce(self.conn_id, seq);
+-        let ciphertext = crypto::encrypt(&self.psk, &nonce, &payload);
++        let ciphertext = crypto::encrypt(&self.psk, &nonce, &payload).map_err(|e| anyhow::anyhow!("encrypt: {}", e))?;
+         let pkt = build_encrypted(self.conn_id, STREAM_CONTROL, seq, &nonce, &ciphertext);
+         self.socket.send(&pkt).await?;
+         Ok(())
+@@ -191,7 +191,7 @@ impl Connection {
+         timeout_secs: u64,
+         mut on_event: impl FnMut(ExecEvent) + Send + 'static,
+     ) -> anyhow::Result<Option<i32>> {
+-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
++        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+         self.send_control(&ControlMsg::Exec { id, cmd: cmd.to_string() }).await?;
+         if let Some(data) = stdin_bytes {
+             self.send_control(&ControlMsg::ExecStdin { id, data, close: true }).await?;
+diff --git a/crates/protocol/src/crypto.rs b/crates/protocol/src/crypto.rs
+index f8315d6..d1e7855 100644
+--- a/crates/protocol/src/crypto.rs
++++ b/crates/protocol/src/crypto.rs
+@@ -20,10 +20,10 @@ pub fn generate_psk() -> Psk {
+ 
+ /// Encrypt plaintext, producing ciphertext + 16-byte authentication tag.
+ /// `nonce` must be exactly 12 bytes.
+-pub fn encrypt(key: &Psk, nonce: &[u8; 12], plaintext: &[u8]) -> Vec<u8> {
++pub fn encrypt(key: &Psk, nonce: &[u8; 12], plaintext: &[u8]) -> Result<Vec<u8>, chacha20poly1305::Error> {
+     let cipher = ChaCha20Poly1305::new_from_slice(key).expect("valid key size");
+     let nonce = Nonce::from_slice(nonce);
+-    cipher.encrypt(nonce, plaintext).expect("encryption failed")
++    cipher.encrypt(nonce, plaintext)
+ }
+ 
+ /// Decrypt ciphertext (which includes the 16-byte auth tag appended).
+@@ -52,7 +52,7 @@ mod tests {
+         let psk = generate_psk();
+         let nonce = make_nonce(42, 1);
+         let plain = b"hello world";
+-        let cipher = encrypt(&psk, &nonce, plain);
++        let cipher = encrypt(&psk, &nonce, plain).unwrap();
+         assert_eq!(cipher.len(), plain.len() + 16);
+         let dec = decrypt(&psk, &nonce, &cipher).unwrap();
+         assert_eq!(&dec, plain);
+@@ -62,7 +62,7 @@ mod tests {
+     fn tamper_detection() {
+         let psk = generate_psk();
+         let nonce = make_nonce(42, 1);
+-        let mut cipher = encrypt(&psk, &nonce, b"hello");
++        let mut cipher = encrypt(&psk, &nonce, b"hello").unwrap();
+         cipher[0] ^= 1;
+         assert!(decrypt(&psk, &nonce, &cipher).is_none());
+     }
+diff --git a/crates/protocol/src/reliable.rs b/crates/protocol/src/reliable.rs
+index 29e6981..ab79cac 100644
+--- a/crates/protocol/src/reliable.rs
++++ b/crates/protocol/src/reliable.rs
+@@ -72,7 +72,7 @@ impl ReliableSender {
+             if dist == 0 {
+                 slot.acked = true;
+                 acked.push(slot.seq);
+-            } else if dist <= WINDOW_SIZE && (ack_bitmap & (1 << (dist - 1))) != 0 {
++            } else if dist <= WINDOW_SIZE && (ack_bitmap & (1u32.checked_shl(dist - 1).unwrap_or(0))) != 0 {
+                 slot.acked = true;
+                 acked.push(slot.seq);
+             }
+@@ -184,6 +184,7 @@ impl ReliableReceiver {
+             vec![]
+         } else {
+             // Outside window, discard
++            tracing::warn!("deliver: seq {} outside window (next_expected={}), dropping", seq, self.next_expected);
+             vec![]
+         }
+     }
