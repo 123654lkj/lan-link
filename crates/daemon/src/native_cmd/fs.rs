@@ -86,28 +86,43 @@ pub fn cmd_head(path: &str, lines: u32) -> (Vec<u8>, Option<i32>) {
     )
 }
 
-pub fn cmd_tail(path: &str, n: u32) -> (Vec<u8>, Option<i32>) {
+pub fn cmd_tail(path: &str, n: u32, follow: bool, follow_secs: u64) -> (Vec<u8>, Option<i32>) {
     let c = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(e) => return (format!("tail: {}: {}\n", path, e).into_bytes(), Some(1)),
     };
 
-    let l: Vec<&str> = c.lines().collect();
-
-    let start = if (n as usize) >= l.len() {
+    let lines: Vec<&str> = c.lines().collect();
+    let start = if (n as usize) >= lines.len() {
         0
     } else {
-        l.len() - n as usize
+        lines.len() - n as usize
     };
 
-    (
-        l[start..]
-            .iter()
-            .flat_map(|l| [*l, "\n"])
-            .collect::<String>()
-            .into_bytes(),
-        Some(0),
-    )
+    let mut out: String = lines[start..]
+        .iter()
+        .flat_map(|l| [*l, "\n"])
+        .collect();
+
+    if follow {
+        let secs = if follow_secs > 0 { follow_secs } else { 1 };
+        let mut known_count = lines.len();
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(secs));
+            if let Ok(new_c) = std::fs::read_to_string(path) {
+                let new_lines: Vec<&str> = new_c.lines().collect();
+                if new_lines.len() > known_count {
+                    for line in &new_lines[known_count..] {
+                        out += line;
+                        out += "\n";
+                    }
+                    known_count = new_lines.len();
+                }
+            }
+        }
+    }
+
+    (out.into_bytes(), Some(0))
 }
 
 pub fn cmd_stat(path: &str) -> (Vec<u8>, Option<i32>) {
