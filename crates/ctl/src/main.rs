@@ -27,6 +27,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::{UdpSocket, TcpStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{info, warn};
+mod tui;
 
 const CHUNK_SIZE: usize = 1024;
 const PORT_CANDIDATES: [u16; 10] = [9876, 9877, 9878, 9879, 9880, 9881, 9882, 9883, 9884, 9885];
@@ -215,6 +216,11 @@ enum Cmd {
     #[command(about = "Touch file/directory on remote")]
     Touch { path: String },
 
+    #[command(about = "启动交互式 TUI 终端（类似 cmd）")]
+    Tui {
+        #[arg(long, default_value = "300", help = "连接超时秒数")]
+        timeout: u64,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -917,6 +923,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Cmd::Signal { id, signal } => { let mut ctx = new_ctx!(); ctx.send_control(&ControlMsg::ExecSignal { id, signo: signal }).await?; }
         Cmd::WriteFile { path, data, append } => { let mut ctx = new_ctx!(); nc!(&mut ctx, NativeCmdType::WriteFile { path: path.clone(), data: data.as_bytes().to_vec(), append }); }
+        Cmd::Tui { .. } => {
+            tui::run_tui(resolved_psk, cli.addr.clone()).await?;
+        }
         Cmd::Status => { let ctx = new_ctx!(); println!("Connected to {} (conn_id={})", ctx.remote, ctx.conn_id); }
         Cmd::Version => { println!("lan-linkctl {}", env!("CARGO_PKG_VERSION")); }
         Cmd::Sed { path, pattern, replacement, global, regex } => { let mut ctx = new_ctx!(); nc!(&mut ctx, NativeCmdType::Sed { path: path.clone(), pattern: pattern.clone(), replacement: replacement.clone(), global, regex }); }
