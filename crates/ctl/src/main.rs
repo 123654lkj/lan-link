@@ -198,18 +198,12 @@ enum Cmd {
     Ssh,
     #[command(about = "计算远端文件校验和")]
     Checksum { path: String, #[arg(long, default_value = "sha256")] algorithm: String },
-    #[command(about = "向远端发送键盘事件（已弃用）")]
-    Key { #[arg(long)] scancode: u16, #[arg(long)] vk: u16, #[arg(long)] release: bool },
-    #[command(about = "向远端发送鼠标事件（已弃用）")]
-    Mouse { #[command(subcommand)] action: MouseAction },
     #[command(about = "给正在运行的 exec 发送信号")]
     Signal { id: u32, #[arg(short, default_value = "15")] signal: u32 },
     #[command(about = "测试与 daemon 的连接状态")]
     Status,
     #[command(about = "显示本客户端版本号")]
     Version,
-    #[command(about = "远端视频流控制（已弃用）")]
-    Video { #[arg(long, default_value = "1920")] width: u16, #[arg(long, default_value = "1080")] height: u16, #[arg(long, default_value = "30")] fps: u8, #[arg(long)] stop: bool },
     #[command(about = "Write file to remote (supports append)")]
     WriteFile { path: String, data: String, #[arg(long)] append: bool },
     #[command(about = "Sed stream editor on remote")]
@@ -285,15 +279,6 @@ enum CrontabAction {
     Remove,
 }
 
-#[derive(Subcommand, Debug)]
-enum MouseAction {
-    #[command(about = "移动鼠标（相对于当前位置，已弃用）")]
-    Move { dx: i32, dy: i32 },
-    #[command(about = "点击鼠标按键")]
-    Click { #[arg(long, default_value = "left")] button: String, #[arg(long)] release: bool },
-    #[command(about = "滚动鼠标滚轮")]
-    Wheel { #[arg(default_value_t = 1)] delta: i16, #[arg(long)] horizontal: bool },
-}
 
 fn encode_control(conn_id: u64, psk: &Psk, seq: u32, msg: &ControlMsg) -> Vec<u8> {
     let payload = bincode::serialize(msg).expect("serialize");
@@ -748,31 +733,9 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Checksum { path, algorithm } => {
             let mut ctx = new_ctx!(); nc!(&mut ctx, NativeCmdType::Checksum { path: path.clone(), algorithm: algorithm.clone() });
         }
-        Cmd::Key { scancode, vk, release } => {
-            let mut ctx = new_ctx!();
-            ctx.send_control(&ControlMsg::KeyEvent { down: true, scancode, vk }).await?;
-            if release { tokio::time::sleep(Duration::from_millis(50)).await; ctx.send_control(&ControlMsg::KeyEvent { down: false, scancode, vk }).await?; }
-        }
-        Cmd::Mouse { action } => {
-            let mut ctx = new_ctx!();
-            match &action {
-                MouseAction::Move { dx, dy } => { ctx.send_control(&ControlMsg::MouseMove { dx: *dx as i16, dy: *dy as i16 }).await?; }
-                MouseAction::Click { button, release } => {
-                    let btn = match button.as_str() { "left" => 0, "right" => 1, "middle" => 2, _ => 0 };
-                    ctx.send_control(&ControlMsg::MouseButton { button: btn, down: true }).await?;
-                    if !release { tokio::time::sleep(Duration::from_millis(50)).await; ctx.send_control(&ControlMsg::MouseButton { button: btn, down: false }).await?; }
-                }
-                MouseAction::Wheel { delta, .. } => { ctx.send_control(&ControlMsg::MouseWheel { delta: *delta }).await?; }
-            }
-        }
         Cmd::Signal { id, signal } => { let mut ctx = new_ctx!(); ctx.send_control(&ControlMsg::ExecSignal { id, signo: signal }).await?; }
         Cmd::Status => { let ctx = new_ctx!(); println!("Connected to {} (conn_id={})", ctx.remote, ctx.conn_id); }
         Cmd::Version => { println!("lan-linkctl {}", env!("CARGO_PKG_VERSION")); }
-        Cmd::Video { width, height, fps, stop } => {
-            let mut ctx = new_ctx!();
-            if stop { ctx.send_control(&ControlMsg::VideoStop).await?; }
-            else { ctx.send_control(&ControlMsg::VideoStart { width, height, fps, bitrate_kbps: 5000 }).await?; }
-        }
         Cmd::WriteFile { path, data, append } => { let mut ctx = new_ctx!(); nc!(&mut ctx, NativeCmdType::WriteFile { path: path.clone(), data: data.as_bytes().to_vec(), append }); }
         Cmd::Sed { path, pattern, replacement, global, regex } => { let mut ctx = new_ctx!(); nc!(&mut ctx, NativeCmdType::Sed { path: path.clone(), pattern: pattern.clone(), replacement: replacement.clone(), global, regex }); }
         Cmd::Touch { path } => { let mut ctx = new_ctx!(); nc!(&mut ctx, NativeCmdType::Touch { path: path.clone() }); }
