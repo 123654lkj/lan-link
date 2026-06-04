@@ -546,12 +546,39 @@ async fn handle_control_tcp(
             }
         }
         ControlMsg::FilePush { id, path, size } => {
-            // FilePush over TCP — store and wait for chunks
             info!("TCP FilePush #{}: {} ({} bytes)", id, path, size);
+            match std::fs::OpenOptions::new().write(true).create(true).truncate(true).open(&path) {
+                Ok(file) => {
+                    let mut ft = FILE_TRANSFERS.lock().unwrap();
+                    ft.insert(id, (path.clone(), file, size));
+                    drop(ft);
+                    let pkt = build_control_packet_tcp(conn_id, psk, next_seq(), &ControlMsg::FileAck { id, offset: 0 });
+                    let _ = tcp_send(tcp_conns, conn_id, &pkt).await;
+                }
+                Err(e) => { warn!("TCP FilePush #{} create failed: {}", id, e); }
+            }
         }
         ControlMsg::FileChunk { id, offset, data: chunk } => {
-            // FileChunk over TCP — write to file
-            info!("TCP FileChunk #{}: offset={} len={}", id, offset, chunk.len());
+            let mut ft = FILE_TRANSFERS.lock().unwrap();
+            if let Some((_path, file, _size)) = ft.get_mut(&id) {
+                let _ = file.seek(SeekFrom::Start(offset));
+                if let Err(e) = file.write_all(&chunk) {
+                    warn!("TCP FileChunk #{} write error: {}", id, e);
+                    drop(ft);
+                    return;
+                }
+                let ack_off = offset + chunk.len() as u64;
+                let done = ack_off >= _size;
+                if done {
+                    info!("TCP FilePush #{} complete: {} bytes", id, ack_off);
+                    ft.remove(&id);
+                }
+                drop(ft);
+                let pkt = build_control_packet_tcp(conn_id, psk, next_seq(), &ControlMsg::FileAck { id, offset: ack_off });
+                let _ = tcp_send(tcp_conns, conn_id, &pkt).await;
+            } else {
+                warn!("TCP FileChunk #{}: no active transfer", id);
+            }
         }
         _ => debug!("Unhandled TCP control: {:?}", msg),
     }
@@ -823,6 +850,42 @@ async fn handle_control(
             let _ = send_control(conn_id, peer2, &psk2, next_seq(), &ControlMsg::ExecDone { id, exit_code: exit }, &sock2).await;
         }
 
+        ControlMsg::FilePush { id, path, size } => {
+            info!("FilePush #{}: {} ({} bytes)", id, path, size);
+            match std::fs::OpenOptions::new().write(true).create(true).truncate(true).open(&path) {
+                Ok(file) => {
+                    let mut ft = FILE_TRANSFERS.lock().unwrap();
+                    ft.insert(id, (path.clone(), file, size));
+                    drop(ft);
+                    let _ = send_control(conn_id, peer, psk, next_seq(), &ControlMsg::FileAck { id, offset: 0 }, &send_socket).await;
+                }
+                Err(e) => {
+                    warn!("FilePush #{} create failed: {}", id, e);
+                }
+            }
+        }
+        ControlMsg::FileChunk { id, offset, data: chunk } => {
+            let mut ft = FILE_TRANSFERS.lock().unwrap();
+            if let Some((_path, file, _size)) = ft.get_mut(&id) {
+                let _ = file.seek(SeekFrom::Start(offset));
+                if let Err(e) = file.write_all(&chunk) {
+                    warn!("FileChunk #{} write error: {}", id, e);
+                    drop(ft);
+                    return;
+                }
+                let ack_off = offset + chunk.len() as u64;
+                // Check if transfer complete
+                let done = ack_off >= _size;
+                if done {
+                    info!("FilePush #{} complete: {} bytes", id, ack_off);
+                    ft.remove(&id);
+                }
+                drop(ft);
+                let _ = send_control(conn_id, peer, psk, next_seq(), &ControlMsg::FileAck { id, offset: ack_off }, &send_socket).await;
+            } else {
+                warn!("FileChunk #{}: no active transfer", id);
+            }
+        }
         _ => debug!("Unhandled control: {:?}", msg),
     }
 }
