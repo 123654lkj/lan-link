@@ -19,3 +19,6 @@ dist/
 client_win.py.bak
 *.zip
 .codegraph/
+
+# Build artifacts
+*.tar.gz

@@ -12,7 +12,7 @@ use crate::vpn::identity::NodeID;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 /// 默认会话超时时间（30分钟）
 pub const DEFAULT_SESSION_TIMEOUT_SECS: u64 = 1800;
@@ -346,8 +346,8 @@ impl SessionManager {
     }
 
     /// 获取可变会话
-    pub fn get_mut(&self, remote_id: &NodeID) -> Option<SessionGuard> {
-        let sessions = self.sessions.lock().unwrap();
+    pub fn get_mut(&self, _remote_id: &NodeID) -> Option<SessionGuard<'_>> {
+        let _sessions = self.sessions.lock().unwrap();
         // 由于 Mutex 限制，我们返回一个 guard 包装
         // 在实际使用中，这需要更复杂的实现
         None // 简化实现
@@ -542,7 +542,7 @@ mod tests {
     fn test_session_expiry() {
         let (local_id, _) = NodeID::generate();
         let (remote_id, _) = NodeID::generate();
-        let mut session = Session::with_timeout(
+        let session = Session::with_timeout(
             local_id,
             remote_id,
             Duration::from_millis(10),

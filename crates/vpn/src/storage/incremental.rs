@@ -345,7 +345,7 @@ impl IncrementalSync {
         let (mut local_blocks, need_download) = if Path::new(local_path).exists() {
             let local_data = std::fs::read(local_path)
                 .map_err(|e| format!("failed to read local '{}': {}", local_path, e))?;
-            let diff = self
+            let _diff = self
                 .diff_engine
                 .diff_files(&remote_manifest, &local_data)
                 .map_err(|e| format!("diff computation failed: {}", e))?;
@@ -540,7 +540,7 @@ impl IncrementalSync {
 
         let tx_clone = tx.clone();
         let tag_clone = tag.clone();
-        let file_name_owned = file_name.to_string();
+        let _file_name_owned = file_name.to_string();
         let listener = move |_from: String, data: Vec<u8>| {
             if let Ok(msg) = String::from_utf8(data) {
                 if msg.starts_with(&format!("INCR_BLOCK_RESP:{}:", tag_clone)) {

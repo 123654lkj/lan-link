@@ -626,7 +626,8 @@ mod tests {
         // 但一定不超过 500（请求数）
         assert!(consumed <= 500);
         // 且至少消耗了 0
-        assert!(consumed >= 0);
+        // assert!(consumed >= 0)  // usize always >= 0
+
     }
 
     #[test]

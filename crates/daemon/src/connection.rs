@@ -11,8 +11,10 @@ use std::sync::Arc;
 use std::time::Instant;
 
 #[derive(Debug, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum ConnState { Listening, SynSent, Established, Closed }
 
+#[allow(dead_code)]
 pub struct Connection {
     pub id: u64,
     pub peer: SocketAddr,
@@ -23,6 +25,7 @@ pub struct Connection {
     pub send_seq: Arc<AtomicU64>,
 }
 
+#[allow(dead_code)]
 impl Connection {
     pub fn new(id: u64, peer: SocketAddr) -> Self {
         Self { id, peer, state: ConnState::Listening, mux: StreamMux::new(),

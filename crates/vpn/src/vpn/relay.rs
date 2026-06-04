@@ -12,7 +12,7 @@ use crate::vpn::identity::NodeID;
 use std::collections::HashMap;
 use std::fmt;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream, SocketAddr, ToSocketAddrs};
+use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -164,6 +164,7 @@ impl Message {
 }
 
 /// 连接池中的连接
+    #[allow(dead_code)]
 struct PooledConnection {
     stream: TcpStream,
     peer_id: Option<NodeID>,
@@ -242,7 +243,7 @@ impl ConnectionPool {
     }
 
     /// 归还连接
-    pub fn return_connection(&self, addr: &str, mut stream: TcpStream) {
+    pub fn return_connection(&self, addr: &str, stream: TcpStream) {
         let mut connections = self.connections.lock().unwrap();
         if let Some(pool) = connections.get_mut(addr) {
             for conn in pool.iter_mut() {
@@ -281,6 +282,7 @@ impl ConnectionPool {
 }
 
 /// TCP 服务端
+    #[allow(dead_code)]
 pub struct TcpServer {
     /// 监听地址
     listen_addr: String,
@@ -352,7 +354,7 @@ impl TcpServer {
         mut stream: TcpStream,
         running: Arc<AtomicBool>,
         received: Arc<Mutex<Vec<(NodeID, Message)>>>,
-        local_id: NodeID,
+        _local_id: NodeID,
     ) {
         stream
             .set_read_timeout(Some(Duration::from_secs(30)))
@@ -428,6 +430,7 @@ impl TcpServer {
 }
 
 /// TCP 客户端
+    #[allow(dead_code)]
 pub struct TcpClient {
     /// 本地节点 ID
     local_id: NodeID,

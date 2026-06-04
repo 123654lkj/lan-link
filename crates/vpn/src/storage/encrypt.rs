@@ -68,6 +68,7 @@ pub const NONCE_LEN: usize = 12;
 pub const TAG_LEN: usize = 16;
 
 /// Number of random bytes in the nonce (the remainder after the chunk index).
+#[allow(dead_code)]
 const NONCE_RANDOM_BYTES: usize = 8;
 
 // ---------------------------------------------------------------------------

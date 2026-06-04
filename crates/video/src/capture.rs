@@ -2,12 +2,14 @@
 
 use crate::{VideoCapture, VideoFrame};
 
+#[allow(dead_code)]
 pub struct DxgiCapture {
     width: u32,
     height: u32,
     frame_count: u64,
 }
 
+#[allow(dead_code)]
 impl DxgiCapture {
     pub fn new(monitor_index: u32, width: u32, height: u32) -> Self {
         let _ = monitor_index;

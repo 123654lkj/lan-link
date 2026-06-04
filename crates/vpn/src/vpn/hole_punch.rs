@@ -80,6 +80,7 @@ pub enum PunchResult {
 
 /// 打洞中的连接状态
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct HolePunchConn {
     /// 目标节点 ID
     target: NodeID,
@@ -108,6 +109,7 @@ struct HolePunchConn {
 /// let manager = HolePunchManager::new(local_id);
 /// assert_eq!(manager.active_punches(), 0);
 /// ```
+#[allow(dead_code)]
 pub struct HolePunchManager {
     /// 本地节点 ID
     local_id: NodeID,

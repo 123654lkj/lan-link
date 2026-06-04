@@ -39,6 +39,7 @@ pub const DEFAULT_VERSION_DB_PATH: &str = "version_store.json";
 pub const DEFAULT_MAX_VERSIONS: usize = 10;
 
 /// Maximum length of a version ID string prefix (timestamp portion).
+#[allow(dead_code)]
 const VERSION_TIMESTAMP_LEN: usize = 14; // "20260603120000" = YYYYMMDDHHMMSS
 
 // ---------------------------------------------------------------------------

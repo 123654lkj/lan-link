@@ -21,7 +21,7 @@
 use crate::storage::chunk::Hash;
 use crate::storage::metadata::MetadataStore;
 use crate::storage::version::VersionManager;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 // ---------------------------------------------------------------------------
 // Types

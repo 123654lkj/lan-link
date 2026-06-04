@@ -1,12 +1,12 @@
 use lan_link_protocol::frame::DockerActionType;
 
 pub fn cmd_docker(action: &DockerActionType) -> (Vec<u8>, Option<i32>) {
-    fn docker_api(method: &str, path: &str, body: Option<&str>) -> (Vec<u8>, Option<i32>) {
+    fn docker_api(_method: &str, _path: &str, _body: Option<&str>) -> (Vec<u8>, Option<i32>) {
         for sock in &["/var/run/docker.sock", "/run/docker.sock"] {
             if !std::path::Path::new(sock).exists() {
                 continue;
             }
-            use std::io::{Read, Write};
+            
             #[cfg(target_os = "linux")] if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(sock) {
             #[cfg(not(target_os = "linux"))] { let _ = sock; continue; }
                 let req = if let Some(b) = body {

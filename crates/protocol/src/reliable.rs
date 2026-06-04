@@ -134,6 +134,7 @@ pub struct ReliableReceiver {
     /// Out-of-order buffer: (seq, data)
     ooo_buffer: VecDeque<(u32, Vec<u8>)>,
     /// Last ACK sent
+    #[allow(dead_code)]
     last_ack_seq: u32,
     last_ack_bitmap: u32,
 }

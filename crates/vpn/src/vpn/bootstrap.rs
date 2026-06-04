@@ -303,7 +303,7 @@ impl BootstrapManager {
     /// 连接到入口节点并获取节点列表
     fn connect_to_bootstrap_node(
         &self,
-        node: &BootstrapNode,
+        _node: &BootstrapNode,
     ) -> Result<Vec<KnownNode>, BootstrapError> {
         // 这里简化实现，实际需要 TCP 连接和握手
         // 模拟从入口节点获取节点列表
@@ -315,7 +315,7 @@ impl BootstrapManager {
         // 4. 接收节点列表
 
         // 模拟返回一些已知节点
-        let mut nodes = Vec::new();
+        let nodes = Vec::new();
 
         // 返回空列表（实际实现会返回真实节点）
         Ok(nodes)

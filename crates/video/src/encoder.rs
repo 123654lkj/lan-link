@@ -2,7 +2,9 @@
 
 use crate::{EncodedPacket, VideoConfig, VideoEncoder, VideoFrame};
 
+    #[allow(dead_code)]
 pub struct NvencEncoder { config: VideoConfig, frame_count: u64 }
+    #[allow(dead_code)]
 impl NvencEncoder {
     pub fn new(config: VideoConfig) -> Self { Self { config, frame_count: 0 } }
 }
@@ -11,7 +13,9 @@ impl VideoEncoder for NvencEncoder {
     fn flush(&mut self) -> Vec<EncodedPacket> { vec![] }
 }
 
+    #[allow(dead_code)]
 pub struct SoftwareEncoder { config: VideoConfig }
+    #[allow(dead_code)]
 impl SoftwareEncoder {
     pub fn new(config: VideoConfig) -> Self { Self { config } }
 }

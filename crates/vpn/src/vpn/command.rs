@@ -702,7 +702,7 @@ fn execute_storage_stats() -> Result<String, String> {
 /// 注：当前实现发送完整文件，后续可用 IncrementalSync 优化。
 fn execute_increment(path: &str, target: &str, vpn: &VpnRouter) -> Result<String, String> {
     // 解析目标节点
-    let parsed = ParsedAddress::parse(target)
+    let _parsed = ParsedAddress::parse(target)
         .map_err(|e| format!("invalid target address: {}", e))?;
 
     let file_name = std::path::Path::new(path)

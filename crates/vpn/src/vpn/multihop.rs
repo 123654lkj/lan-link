@@ -639,6 +639,7 @@ mod tests {
     }
 
     /// 辅助：创建具有特定前 16 字节的 NodeID
+    #[allow(dead_code)]
     fn make_id_from(prefix: &[u8]) -> NodeID {
         let mut bytes = [0u8; 32];
         let n = prefix.len().min(32);
@@ -999,7 +1000,7 @@ mod tests {
 
         // 通过 routes 字段直接插入带候选的路由
         {
-            let routes = manager.routes.lock().unwrap();
+            let _routes = manager.routes.lock().unwrap();
             // 我们不受限：routes 是 Arc<Mutex<HashMap>>，可以 clone Arc
         }
         let routes = manager.routes.clone();

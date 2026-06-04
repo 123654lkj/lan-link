@@ -284,8 +284,8 @@ impl ValueEntry {
 /// # 示例
 ///
 /// ```rust
-/// use ll_vpn::vpn::dht::DhtManager;
-/// use ll_vpn::vpn::identity::NodeID;
+/// use lan_link_vpn::vpn::dht::DhtManager;
+/// use lan_link_vpn::vpn::identity::NodeID;
 ///
 /// let local_id = NodeID::from_bytes(&[1u8; 32]);
 /// let dht = DhtManager::new(local_id);
@@ -963,7 +963,7 @@ mod tests {
     #[test]
     fn test_bucket_index_second_byte() {
         // 第二字节首位不同 ⇒ bucket 8
-        let mut local_bytes = [0u8; 32];
+        let local_bytes = [0u8; 32];
         let mut target_bytes = [0u8; 32];
         target_bytes[1] = 0x80;
         let local = make_id_bytes(&local_bytes);
@@ -1034,7 +1034,7 @@ mod tests {
         // 使用只有最后一个字节不同的节点，这样它们都在 bucket 255（或附近）
         for i in 0..K_BUCKET_SIZE + 5 {
             let mut bytes = [0u8; 32];
-            bytes[31] = (0x10 + i as u8);
+            bytes[31] = 0x10 + i as u8;
             let node = make_id_bytes(&bytes);
             let result = dht.insert_node(node, format!("10.0.0.{}:9876", i));
             if i < K_BUCKET_SIZE {
@@ -1117,7 +1117,7 @@ mod tests {
         // 插入 K_BUCKET_SIZE + 10 个节点
         for i in 0..K_BUCKET_SIZE + 10 {
             let mut bytes = [0u8; 32];
-            bytes[31] = (0x10 + i as u8);
+            bytes[31] = 0x10 + i as u8;
             let node = make_id_bytes(&bytes);
             let _ = dht.insert_node(node, format!("10.0.0.{}:9876", i));
         }
@@ -1304,7 +1304,7 @@ mod tests {
         let mut nodes = Vec::new();
         for i in 0..K_BUCKET_SIZE {
             let mut bytes = [0u8; 32];
-            bytes[31] = (0x10 + i as u8);
+            bytes[31] = 0x10 + i as u8;
             let node = make_id_bytes(&bytes);
             let addr = format!("10.0.0.{}:9876", i);
             dht.insert_node(node, addr.clone()).unwrap();
@@ -1327,7 +1327,7 @@ mod tests {
                 // 新节点被插入，最旧节点被淘汰
                 assert!(dht.node_count() <= K_BUCKET_SIZE + 1);
             }
-            Err(Some(evicted)) => {
+            Err(Some(_evicted)) => {
                 // 桶满，返回最旧的待验证节点
                 // 验证返回的是最旧的节点
                 assert_eq!(dht.node_count(), K_BUCKET_SIZE);

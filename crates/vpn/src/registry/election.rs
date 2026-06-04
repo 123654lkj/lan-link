@@ -261,6 +261,8 @@ pub struct ElectionConfig {
     /// 心跳缺失阈值（连续 N 次无响应判定下线）
     pub heartbeat_miss_threshold: u32,
     /// 选举超时时间
+    #[allow(dead_code)]
+    #[allow(dead_code)]
     pub election_timeout: Duration,
 }
 
@@ -363,6 +365,7 @@ pub struct ElectionManager {
     /// 心跳缺失阈值
     heartbeat_miss_threshold: u32,
     /// 选举超时时间
+    #[allow(dead_code)]
     election_timeout: Duration,
     /// 已知节点列表（NodeID → 地址:端口）
     known_nodes: RwLock<Vec<KnownNode>>,
@@ -1268,6 +1271,7 @@ fn compute_candidate_hash(candidate_id: &NodeID, term: u64) -> u64 {
 }
 
 /// 获取当前 Unix 时间戳（秒）
+#[allow(dead_code)]
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1343,6 +1347,7 @@ mod tests {
 
     // ── ElectionManager 测试 ──
 
+    #[allow(dead_code)]
     fn make_id(byte: u8) -> NodeID {
         NodeID::from_bytes(&[byte; 32])
     }
