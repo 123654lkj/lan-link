@@ -25,6 +25,7 @@ pub fn cmd_uptime() -> (Vec<u8>, Option<i32>) {
 pub fn cmd_watch_fn(_interval_secs: u64, cmds: &[String]) -> (Vec<u8>, Option<i32>) {
     let joined = cmds.join(" ");
     match Command::new("/bin/sh")
+        .env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
         .arg("-c")
         .arg(&joined)
         .output()

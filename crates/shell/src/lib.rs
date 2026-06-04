@@ -42,6 +42,7 @@ pub struct StreamChunk {
 pub fn exec(cmd: &str, args: &[&str]) -> anyhow::Result<ExecResult> {
     let mut child = Command::new(cmd)
         .args(args)
+        .env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -57,6 +58,7 @@ pub fn exec(cmd: &str, args: &[&str]) -> anyhow::Result<ExecResult> {
 pub fn exec_with_input(cmd: &str, args: &[&str], stdin_data: &[u8]) -> anyhow::Result<ExecResult> {
     let mut child = Command::new(cmd)
         .args(args)
+        .env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -90,6 +92,7 @@ impl StreamingExec {
             c
         };
         command
+            .env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
