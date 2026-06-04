@@ -21,7 +21,8 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::time::{Duration, Instant};
-use tokio::net::UdpSocket;
+use tokio::net::{UdpSocket, TcpListener, TcpStream};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{info, warn, debug};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -116,6 +117,7 @@ struct Args {
     #[arg(long, default_value = "9877", help = "VPN 中继端口")] vpn_port: u16,
     #[arg(long, help = "本节点名称（启用 VPN 时必需）")] node_name: Option<String>,
     #[arg(long, help = "启用 VPN 模块")] vpn: bool,
+    #[arg(long, help = "同时监听 TCP 端口（默认只监听 UDP）")] tcp: bool,
 }
 
 fn load_or_generate_psk(args: &Args) -> Psk {
@@ -153,8 +155,29 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let psk = load_or_generate_psk(&args);
 
-    let addr = format!("0.0.0.0:{}", args.port);
+    // 端口避让：如果指定端口被占用，依次尝试 +1..+10（共 10 个固定候选端口）
+    let base_port = args.port;
+    let mut chosen_port = base_port;
+    for offset in 0u16..=10 {
+        let test_port = base_port + offset;
+        let test_addr = format!("0.0.0.0:{}", test_port);
+        if UdpSocket::bind(&test_addr).await.is_ok() {
+            chosen_port = test_port;
+            break;
+        }
+    }
+    let addr = format!("0.0.0.0:{}", chosen_port);
     let socket = UdpSocket::bind(&addr).await?;
+    let tcp_listener: Option<Arc<TcpListener>> = if args.tcp {
+        let l = TcpListener::bind(&addr).await?;
+        info!("TCP listener on {}", addr);
+        Some(Arc::new(l))
+    } else {
+        None
+    };
+    if chosen_port != args.port {
+        info!("Port {} in use, fell back to {}", args.port, chosen_port);
+    }
     info!("lan-linkd listening on {}", addr);
 
     if args.discovery {
@@ -204,11 +227,31 @@ async fn main() -> anyhow::Result<()> {
 
     let hb_socket = UdpSocket::bind("0.0.0.0:0").await?;
     let send_socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
+    let tcp_peers: Arc<tokio::sync::Mutex<HashMap<SocketAddr, TcpStream>>> = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let mut connections: HashMap<u64, Connection> = HashMap::new();
     let mut buf = vec![0u8; lan_link_protocol::frame::MAX_PACKET];
     let exec_map: ExecMap = new_exec_map();
     let mut last_hb = Instant::now();
     let mut rate_limiter = RateLimiter::new();
+
+    // TCP accept 后台任务
+    if let Some(listener) = tcp_listener.clone() {
+        let tcp_peers_clone = tcp_peers.clone();
+        let psk_clone = psk.clone();
+        let exec_map_clone = exec_map.clone();
+        let send_socket_clone = send_socket.clone();
+        tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((stream, peer)) => {
+                        info!("TCP connection from {}", peer);
+                        tcp_peers_clone.lock().await.insert(peer, stream);
+                    }
+                    Err(e) => warn!("TCP accept error: {}", e),
+                }
+            }
+        });
+    }
 
     loop {
         match tokio::time::timeout(Duration::from_millis(100), socket.recv_from(&mut buf)).await {

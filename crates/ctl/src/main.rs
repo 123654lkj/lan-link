@@ -24,7 +24,9 @@ use std::io::{self, Write};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::net::UdpSocket;
+use tokio::net::{UdpSocket, TcpStream};
+use tokio::io::AsyncReadExt;
+use tokio::io::AsyncWriteExt;
 use tracing::{info, warn};
 
 const CHUNK_SIZE: usize = 1024;
@@ -302,8 +304,13 @@ fn parse_packet(data: &[u8]) -> Option<(PacketHeader, &[u8])> {
     Some((hdr, &data[HEADER_SIZE..]))
 }
 
+enum ConnSocket {
+    Udp(UdpSocket),
+    Tcp(TcpStream, SocketAddr),
+}
+
 struct Ctx {
-    socket: UdpSocket,
+    conn: ConnSocket,
     remote: SocketAddr,
     psk: Psk,
     conn_id: u64,
@@ -313,28 +320,28 @@ struct Ctx {
 impl Ctx {
     async fn new(addr: &str, psk_hex: &str) -> anyhow::Result<Self> {
         let remote: SocketAddr = addr.parse()?;
-        let socket = UdpSocket::bind("0.0.0.0:0").await?;
         let psk_bytes = hex::decode(psk_hex)?;
         anyhow::ensure!(psk_bytes.len() == 32, "PSK must be 32 bytes");
         let mut psk: Psk = [0u8; 32];
         psk.copy_from_slice(&psk_bytes);
         let conn_id: u64 = rand::random();
-        let mut ctx = Self { socket, remote, psk, conn_id, seq: 0 };
 
-        let syn = encode_packet(conn_id, PacketType::Syn, StreamId::Control as u16, 0, Flags::empty(), &[], [0u8; 12]);
-        ctx.socket.send_to(&syn, remote).await?;
-        info!("Sent SYN (conn={})", conn_id);
+        // 先试 UDP，超时后回退到 TCP
+        let (conn, _) = match Self::try_connect_udp(remote, conn_id, &psk).await {
+            Ok(c) => c,
+            Err(_) => {
+                info!("UDP failed, falling back to TCP...");
+                Self::try_connect_tcp(remote, conn_id, &psk).await?
+            }
+        };
 
-        let (hdr, _) = ctx.recv_parsed(Duration::from_secs(5)).await?;
-        if hdr.pkt_type != PacketType::SynAck || hdr.conn_id != conn_id {
-            anyhow::bail!("Expected SYN-ACK");
-        }
+        let mut ctx = Ctx { conn, remote, psk, conn_id, seq: 0 };
 
         ctx.seq += 1;
-        let hello = encode_control(conn_id, &ctx.psk, ctx.seq, &ControlMsg::Hello {
+        let hello = Self::encode_ctrl_msg(&ctx.psk, ctx.conn_id, ctx.seq, &ControlMsg::Hello {
             version: lan_link_protocol::frame::PROTOCOL_VERSION, capabilities: vec!["exec".into(), "input".into()],
         });
-        ctx.socket.send_to(&hello, remote).await?;
+        ctx.send_raw(&hello).await?;
 
         if let Some(msg) = ctx.recv_control(Duration::from_secs(5)).await? {
             if let ControlMsg::HelloAck { version: v, capabilities: caps } = msg {
@@ -345,19 +352,94 @@ impl Ctx {
         Ok(ctx)
     }
 
+    async fn try_connect_udp(remote: SocketAddr, conn_id: u64, _psk: &Psk) -> anyhow::Result<(ConnSocket, u32)> {
+        let socket = UdpSocket::bind("0.0.0.0:0").await?;
+        let syn = encode_packet(conn_id, PacketType::Syn, StreamId::Control as u16, 0, Flags::empty(), &[], [0u8; 12]);
+        socket.send_to(&syn, remote).await?;
+        info!("Sent SYN (UDP conn={})", conn_id);
+
+        let mut buf = vec![0u8; lan_link_protocol::frame::MAX_PACKET];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(3), socket.recv_from(&mut buf)).await??;
+        let (hdr, _) = parse_packet(&buf[..n]).ok_or_else(|| anyhow::anyhow!("Bad SYN-ACK"))?;
+        if hdr.pkt_type != PacketType::SynAck || hdr.conn_id != conn_id {
+            anyhow::bail!("Expected SYN-ACK");
+        }
+        info!("UDP SYN-ACK received");
+        Ok((ConnSocket::Udp(socket), 0))
+    }
+
+    async fn try_connect_tcp(remote: SocketAddr, conn_id: u64, psk: &Psk) -> anyhow::Result<(ConnSocket, u32)> {
+        let stream = TcpStream::connect(remote).await?;
+        let syn = encode_packet(conn_id, PacketType::Syn, StreamId::Control as u16, 0, Flags::empty(), &[], [0u8; 12]);
+        let mut sock = stream;
+        sock.write_all(&syn).await?;
+        info!("Sent SYN (TCP conn={})", conn_id);
+
+        // TCP response: read 4-byte len prefix + packet
+        // 简化：daemon 端 TCP 响应按 stream 写，这里先读固定大小
+        let mut len_buf = [0u8; 2];
+        sock.read_exact(&mut len_buf).await?;
+        let pkt_len = u16::from_be_bytes(len_buf) as usize;
+        let mut pkt_buf = vec![0u8; pkt_len];
+        sock.read_exact(&mut pkt_buf).await?;
+        
+        let (hdr, _) = parse_packet(&pkt_buf).ok_or_else(|| anyhow::anyhow!("Bad TCP SYN-ACK"))?;
+        if hdr.pkt_type != PacketType::SynAck || hdr.conn_id != conn_id {
+            anyhow::bail!("Expected SYN-ACK from TCP");
+        }
+        info!("TCP SYN-ACK received");
+        Ok((ConnSocket::Tcp(sock, remote), 0))
+    }
+
+    fn encode_ctrl_msg(psk: &Psk, conn_id: u64, seq: u32, msg: &ControlMsg) -> Vec<u8> {
+        let payload = bincode::serialize(msg).unwrap();
+        let seq32 = seq;
+        let nonce = crypto::make_nonce(conn_id, seq32);
+        let encrypted = crypto::encrypt(psk, &nonce, &payload).unwrap();
+        encode_packet(conn_id, PacketType::Data, StreamId::Control as u16, seq32, Flags::RELIABLE, &encrypted, nonce)
+    }
+
+    async fn send_raw(&mut self, data: &[u8]) -> anyhow::Result<()> {
+        match &mut self.conn {
+            ConnSocket::Udp(sock) => { sock.send_to(data, self.remote).await?; }
+            ConnSocket::Tcp(sock, _) => {
+                let len = (data.len() as u16).to_be_bytes();
+                let mut pkt = Vec::with_capacity(2 + data.len());
+                pkt.extend_from_slice(&len);
+                pkt.extend_from_slice(data);
+                sock.write_all(&pkt).await?;
+            }
+        }
+        Ok(())
+    }
+
     async fn send_control(&mut self, msg: &ControlMsg) -> anyhow::Result<()> {
         self.seq += 1;
         let pkt = encode_control(self.conn_id, &self.psk, self.seq, msg);
-        self.socket.send_to(&pkt, self.remote).await?;
+        self.send_raw(&pkt).await?;
         Ok(())
     }
 
     async fn recv_parsed(&mut self, timeout: Duration) -> anyhow::Result<(PacketHeader, Vec<u8>)> {
-        let mut buf = vec![0u8; lan_link_protocol::frame::MAX_PACKET];
-        let (n, _) = tokio::time::timeout(timeout, self.socket.recv_from(&mut buf)).await??;
-        let (hdr, ct) = parse_packet(&buf[..n]).ok_or_else(|| anyhow::anyhow!("Bad packet"))?;
-        let end = std::cmp::min(hdr.payload_len as usize, ct.len());
-        Ok((hdr, ct[..end].to_vec()))
+        match &mut self.conn {
+            ConnSocket::Udp(sock) => {
+                let mut buf = vec![0u8; lan_link_protocol::frame::MAX_PACKET];
+                let (n, _) = tokio::time::timeout(timeout, sock.recv_from(&mut buf)).await??;
+                let (hdr, ct) = parse_packet(&buf[..n]).ok_or_else(|| anyhow::anyhow!("Bad packet"))?;
+                let end = std::cmp::min(hdr.payload_len as usize, ct.len());
+                Ok((hdr, ct[..end].to_vec()))
+            }
+            ConnSocket::Tcp(sock, _) => {
+                let mut len_buf = [0u8; 2];
+                tokio::time::timeout(timeout, sock.read_exact(&mut len_buf)).await??;
+                let pkt_len = u16::from_be_bytes(len_buf) as usize;
+                let mut buf = vec![0u8; pkt_len];
+                tokio::time::timeout(timeout, sock.read_exact(&mut buf)).await??;
+                let (hdr, ct) = parse_packet(&buf[..pkt_len]).ok_or_else(|| anyhow::anyhow!("Bad TCP packet"))?;
+                let end = std::cmp::min(hdr.payload_len as usize, ct.len());
+                Ok((hdr, ct[..end].to_vec()))
+            }
+        }
     }
 
     async fn recv_control(&mut self, timeout: Duration) -> anyhow::Result<Option<ControlMsg>> {
