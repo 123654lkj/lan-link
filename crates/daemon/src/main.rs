@@ -1,4 +1,4 @@
-//! lan-linkd — 局域网远程管理守护进程
+﻿//! lan-linkd — 局域网远程管理守护进程
 //!
 //! 运行在目标机器上的服务端二进制，通过 UDP 端口（默认 9876）监听客户端连接。
 //!
@@ -113,6 +113,9 @@ struct Args {
     #[arg(short, long, default_value = "9876", help = "监听端口")] port: u16,
     #[arg(short, long, help = "手动指定 PSK hex（不指定则自动生成/读取）")] psk: Option<String>,
     #[arg(long, default_value = "true", help = "启用 mDNS 发现")] discovery: bool,
+    #[arg(long, default_value = "9877", help = "VPN 中继端口")] vpn_port: u16,
+    #[arg(long, help = "本节点名称（启用 VPN 时必需）")] node_name: Option<String>,
+    #[arg(long, help = "启用 VPN 模块")] vpn: bool,
 }
 
 fn load_or_generate_psk(args: &Args) -> Psk {
@@ -156,6 +159,47 @@ async fn main() -> anyhow::Result<()> {
 
     if args.discovery {
         tokio::spawn(discovery::run(args.port));
+    }
+
+    // -- VPN 初始化 --
+    if args.vpn {
+        let node_name = args.node_name.clone().unwrap_or_else(|| {
+            info!("--node-name not specified, using hostname");
+            std::fs::read_to_string("/etc/hostname").ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "unknown".into())
+        });
+        info!("VPN enabled: node_name={}, vpn_port={}", node_name, args.vpn_port);
+
+        // 从 psk 生成节点 ID 以保证稳定性
+        let id_bytes = {
+            use sha2::{Sha256, Digest};
+            let mut hasher = Sha256::new();
+            hasher.update(node_name.as_bytes());
+            hasher.update(&psk);
+            let result = hasher.finalize();
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&result[..32]);
+            arr
+        };
+        let node_id = lan_link_vpn::vpn::identity::NodeID::from_bytes(&id_bytes);
+        let vpn_resolver = std::sync::Arc::new(lan_link_vpn::address::MemAddressResolver::new())
+            as std::sync::Arc<dyn lan_link_vpn::address::AddressResolver + Send + Sync>;
+        let relay_mgr = lan_link_vpn::vpn::relay::RelayManager::new(node_id, args.vpn_port);
+
+        let vpn_handle = lan_link_vpn::vpn::vpn_router::VpnRouter::with_port(
+            &node_name,
+            node_id,
+            vpn_resolver,
+            None,
+            relay_mgr,
+            args.vpn_port,
+        );
+        match vpn_handle.start() {
+            Ok(_) => info!("VPN started on port {}", args.vpn_port),
+            Err(e) => warn!("VPN start failed: {:?}", e),
+        }
     }
 
     let hb_socket = UdpSocket::bind("0.0.0.0:0").await?;

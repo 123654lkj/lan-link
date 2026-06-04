@@ -1,6 +1,6 @@
 [package]
 name = "lan-linkd"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 
 [[bin]]
@@ -11,6 +11,7 @@ path = "src/main.rs"
 lan-link-protocol = { path = "../protocol" }
 lan-link-video = { path = "../video" }
 lan-link-shell = { path = "../shell" }
+lan-link-vpn = { path = "../vpn" }
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"

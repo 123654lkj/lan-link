@@ -57,6 +57,8 @@ struct Cli {
     addr: String,
     #[arg(short, long, help = "32 字节 PSK hex 字符串（默认从 LAN_LINK_PSK 环境变量读取）")]
     psk: Option<String>,
+    #[arg(long, help = "VPN mode (address format node:<name>)")]
+    vpn: bool,
     #[command(subcommand)]
     command: Cmd,
 }
@@ -454,6 +456,11 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
     let resolved_psk = resolve_psk(&cli.psk);
+
+    if cli.vpn {
+        println!("VPN mode: routing through VPN mesh (TODO)");
+    }
+
     macro_rules! new_ctx { () => { Ctx::new(&cli.addr, &resolved_psk).await? }; }
     macro_rules! nc { ($ctx:expr, $cmd:expr) => { native_run($ctx, 1, $cmd, 30).await? }; ($ctx:expr, $cmd:expr, $to:expr) => { native_run($ctx, 1, $cmd, $to).await? }; }
 
