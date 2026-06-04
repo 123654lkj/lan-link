@@ -223,6 +223,77 @@ async fn main() -> anyhow::Result<()> {
             Ok(_) => info!("VPN started on port {}", args.vpn_port),
             Err(e) => warn!("VPN start failed: {:?}", e),
         }
+
+        // -- DHT + Bootstrap 集成 --
+        use lan_link_vpn::router::{ConnectionType, NodeStatus};
+
+        let relay_arc = vpn_handle.relay_manager_arc();
+
+        let mut dht_mgr = lan_link_vpn::vpn::dht::DhtManager::new(node_id);
+        dht_mgr.set_relay_manager(relay_arc);
+        dht_mgr.set_local_addr(format!("0.0.0.0:{}", args.vpn_port));
+        dht_mgr.start();
+
+        // 插入本节点到 DHT 路由表
+        let _ = dht_mgr.insert_node(node_id, format!("0.0.0.0:{}", args.vpn_port));
+
+        // Bootstrap 配置：从环境变量 LL_BOOTSTRAP 解析引导节点列表
+        // 默认值 192.168.31.244:9876（团子）
+        let bootstrap_addr = std::env::var("LL_BOOTSTRAP")
+            .unwrap_or_else(|_| "192.168.31.244:9876".to_string());
+        let bootstrap_nodes: Vec<lan_link_vpn::vpn::bootstrap::BootstrapNode> = bootstrap_addr
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .filter_map(|s| {
+                let parts: Vec<&str> = s.trim().split(':').collect();
+                if parts.len() == 2 {
+                    if let Ok(port) = parts[1].parse::<u16>() {
+                        return Some(lan_link_vpn::vpn::bootstrap::BootstrapNode::new(parts[0], port));
+                    }
+                }
+                None
+            })
+            .collect();
+        if !bootstrap_nodes.is_empty() {
+            dht_mgr.bootstrap_from_nodes(&bootstrap_nodes);
+            info!(
+                "DHT bootstrapped from {}",
+                bootstrap_nodes.iter().map(|n| n.addr()).collect::<Vec<_>>().join(", ")
+            );
+        }
+
+        let dht = Arc::new(dht_mgr);
+        let vpn_handle = Arc::new(vpn_handle);
+
+        // 定期刷新 DHT 路由表（每 300 秒 PING 过期节点）
+        let dht_refresh = dht.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(300)).await;
+                let pinged = dht_refresh.refresh();
+                if pinged > 0 {
+                    debug!("DHT refresh: pinged {} stale nodes", pinged);
+                }
+            }
+        });
+
+        // 节点列表同步：从 DHT 获取已知节点更新到 VpnRouter
+        let dht_sync = dht.clone();
+        let vpn_sync = vpn_handle.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                let nodes = dht_sync.all_nodes();
+                for (node_id, _addr) in &nodes {
+                    vpn_sync.update_node(
+                        &node_id.to_hex(),
+                        *node_id,
+                        ConnectionType::Vpn,
+                        NodeStatus::Online,
+                    );
+                }
+            }
+        });
     }
 
     let hb_socket = UdpSocket::bind("0.0.0.0:0").await?;

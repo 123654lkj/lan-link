@@ -152,6 +152,11 @@ impl VpnRouter {
         &self.relay_manager
     }
 
+    /// 获取中继管理器 Arc 引用（供 DHT 等子系统使用）
+    pub fn relay_manager_arc(&self) -> Arc<RelayManager> {
+        Arc::clone(&self.relay_manager)
+    }
+
     /// 注册数据接收监听器
     ///
     /// 当收到其他节点发来的数据时，会调用所有已注册的监听器。
@@ -243,7 +248,7 @@ impl VpnRouter {
     }
 
     /// 更新已知节点状态
-    fn update_node(
+    pub fn update_node(
         &self,
         name: &str,
         id: NodeID,
