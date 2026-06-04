@@ -284,12 +284,12 @@ fn encode_control(conn_id: u64, psk: &Psk, seq: u32, msg: &ControlMsg) -> Vec<u8
     let payload = bincode::serialize(msg).expect("serialize");
     let nonce = crypto::make_nonce(conn_id, seq);
     let encrypted = crypto::encrypt(psk, &nonce, &payload).expect("encrypt");
-    encode_packet(conn_id, PacketType::Data, StreamId::Control as u16, seq, Flags::RELIABLE, &encrypted)
+    encode_packet(conn_id, PacketType::Data, StreamId::Control as u16, seq, Flags::RELIABLE, &encrypted, nonce)
 }
 
-fn encode_packet(conn_id: u64, pkt_type: PacketType, stream_id: u16, seq: u32, flags: Flags, payload: &[u8]) -> Vec<u8> {
+fn encode_packet(conn_id: u64, pkt_type: PacketType, stream_id: u16, seq: u32, flags: Flags, payload: &[u8], nonce: [u8; 12]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(HEADER_SIZE + payload.len());
-    PacketHeader { conn_id, pkt_type, flags, stream_id, seq, ack_seq: 0, ack_bitmap: 0, payload_len: payload.len() as u16, nonce: [0u8; 12] }.encode(&mut buf);
+    PacketHeader { conn_id, pkt_type, flags, stream_id, seq, ack_seq: 0, ack_bitmap: 0, payload_len: payload.len() as u16, nonce }.encode(&mut buf);
     buf.extend_from_slice(payload);
     buf
 }
@@ -319,7 +319,7 @@ impl Ctx {
         let conn_id: u64 = rand::random();
         let mut ctx = Self { socket, remote, psk, conn_id, seq: 0 };
 
-        let syn = encode_packet(conn_id, PacketType::Syn, StreamId::Control as u16, 0, Flags::empty(), &[]);
+        let syn = encode_packet(conn_id, PacketType::Syn, StreamId::Control as u16, 0, Flags::empty(), &[], [0u8; 12]);
         ctx.socket.send_to(&syn, remote).await?;
         info!("Sent SYN (conn={})", conn_id);
 
@@ -734,9 +734,9 @@ async fn main() -> anyhow::Result<()> {
             let mut ctx = new_ctx!(); nc!(&mut ctx, NativeCmdType::Checksum { path: path.clone(), algorithm: algorithm.clone() });
         }
         Cmd::Signal { id, signal } => { let mut ctx = new_ctx!(); ctx.send_control(&ControlMsg::ExecSignal { id, signo: signal }).await?; }
+        Cmd::WriteFile { path, data, append } => { let mut ctx = new_ctx!(); nc!(&mut ctx, NativeCmdType::WriteFile { path: path.clone(), data: data.as_bytes().to_vec(), append }); }
         Cmd::Status => { let ctx = new_ctx!(); println!("Connected to {} (conn_id={})", ctx.remote, ctx.conn_id); }
         Cmd::Version => { println!("lan-linkctl {}", env!("CARGO_PKG_VERSION")); }
-        Cmd::WriteFile { path, data, append } => { let mut ctx = new_ctx!(); nc!(&mut ctx, NativeCmdType::WriteFile { path: path.clone(), data: data.as_bytes().to_vec(), append }); }
         Cmd::Sed { path, pattern, replacement, global, regex } => { let mut ctx = new_ctx!(); nc!(&mut ctx, NativeCmdType::Sed { path: path.clone(), pattern: pattern.clone(), replacement: replacement.clone(), global, regex }); }
         Cmd::Touch { path } => { let mut ctx = new_ctx!(); nc!(&mut ctx, NativeCmdType::Touch { path: path.clone() }); }
     }

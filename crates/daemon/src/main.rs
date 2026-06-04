@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tracing::{info, warn, debug};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::Mutex as AsyncMutex;
 
 mod connection;
@@ -41,7 +42,6 @@ enum ExecCmd {
 /// Global map of running exec id -> command sender.
 type ExecMap = Arc<AsyncMutex<HashMap<u32, tokio::sync::mpsc::UnboundedSender<ExecCmd>>>>;
 fn new_exec_map() -> ExecMap { Arc::new(AsyncMutex::new(HashMap::new())) }
-
 
 const PSK_PATH: &str = "/etc/lan-link/psk";
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
@@ -166,7 +166,6 @@ async fn main() -> anyhow::Result<()> {
     let mut last_hb = Instant::now();
     let mut rate_limiter = RateLimiter::new();
 
-
     loop {
         match tokio::time::timeout(Duration::from_millis(100), socket.recv_from(&mut buf)).await {
             Ok(Ok((n, peer))) => {
@@ -274,12 +273,9 @@ async fn handle_packet_inner(
                 if let Some(seq) = ctrl_seq {
                     handle_control(&plaintext, conn_id, peer, psk, &exec_map, send_socket.clone(), seq).await;
                 }
-            } else if stream_id == StreamId::Input as u16 {
-                #[cfg(target_os = "linux")]
-                    #[cfg(not(target_os = "linux"))]
-                debug!("Input ignored (not Linux)");
-            }
         }
+            }
+
         PacketType::Heartbeat => {
             if let Some(conn) = connections.get_mut(&conn_id) {
                 if conn.state != ConnState::Established || conn.peer != peer {
@@ -295,37 +291,7 @@ async fn handle_packet_inner(
     }
 }
 
-#[cfg(target_os = "linux")]
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
 
-#[cfg(target_os = "linux")]
-static INJECT_COUNT: AtomicU64 = AtomicU64::new(0);
-#[cfg(target_os = "linux")]
-static INJECTOR: OnceLock<Mutex<LinuxInputInjector>> = OnceLock::new();
-
-#[cfg(target_os = "linux")]
-
-fn handle_input_linux(data: &[u8], peer: SocketAddr) {
-        if let Ok(ev) = bincode::deserialize::<lan_link_input::MouseEvent>(data) {
-        debug!("Mouse event from {}: {:?}", peer, ev);
-        let mut inj = injector();
-        let bytes = inj.inject_mouse(&ev);
-        let count = INJECT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-        if bytes <= 0 || bytes % 24 != 0 { warn!("uinput mouse inject bad write: {} bytes (expected multiple of 24)", bytes); }
-        if count % 50 == 0 || bytes < 0 { info!("inject_total={} bytes={} (last mouse: {:?})", count, bytes, ev); }
-    } else if let Ok(ev) = bincode::deserialize::<lan_link_input::KeyEvent>(data) {
-        debug!("Key event from {}: scancode={}", peer, ev.scancode);
-        let mut inj = injector();
-        let bytes = inj.inject_key(&ev);
-        let count = INJECT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-        if bytes <= 0 || bytes % 24 != 0 { warn!("uinput key inject bad write: {} bytes (expected multiple of 24)", bytes); }
-        if count % 50 == 0 || bytes < 0 { info!("inject_total={} bytes={} (last key: scancode={})", count, bytes, ev.scancode); }
-    } else {
-        warn!("input deserialize failed from {}: {} bytes", peer, data.len());
-    }
-}
 
 async fn handle_control(
     data: &[u8], conn_id: u64, peer: SocketAddr,
