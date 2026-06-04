@@ -24,10 +24,12 @@ use std::io::{self, Write};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::net::UdpSocket;
+use tokio::net::{UdpSocket, TcpStream};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{info, warn};
 
 const CHUNK_SIZE: usize = 1024;
+const PORT_CANDIDATES: [u16; 10] = [9876, 9877, 9878, 9879, 9880, 9881, 9882, 9883, 9884, 9885];
 
 /// Resolve PSK from --psk argument or LAN_LINK_PSK env var; exit if neither is set.
 fn resolve_psk(psk_arg: &Option<String>) -> String {
@@ -308,28 +310,148 @@ struct Ctx {
     psk: Psk,
     conn_id: u64,
     seq: u32,
+    tcp: Option<TcpStream>,
 }
 
 impl Ctx {
     async fn new(addr: &str, psk_hex: &str) -> anyhow::Result<Self> {
-        let remote: SocketAddr = addr.parse()?;
-        let socket = UdpSocket::bind("0.0.0.0:0").await?;
         let psk_bytes = hex::decode(psk_hex)?;
         anyhow::ensure!(psk_bytes.len() == 32, "PSK must be 32 bytes");
         let mut psk: Psk = [0u8; 32];
         psk.copy_from_slice(&psk_bytes);
+
+        // Parse addr: if it contains ':', try as host:port first; if no port, scan PORT_CANDIDATES
+        let (host, fixed_port) = if let Ok(sa) = addr.parse::<SocketAddr>() {
+            (sa.ip().to_string(), Some(sa.port()))
+        } else if addr.contains(':') {
+            let parts: Vec<&str> = addr.rsplitn(2, ':').collect();
+            if parts.len() == 2 {
+                (parts[1].to_string(), parts[0].parse::<u16>().ok())
+            } else {
+                (addr.to_string(), None)
+            }
+        } else {
+            (addr.to_string(), None)
+        };
+
+        let ports: Vec<u16> = if let Some(p) = fixed_port {
+            vec![p]
+        } else {
+            PORT_CANDIDATES.to_vec()
+        };
+
         let conn_id: u64 = rand::random();
-        let mut ctx = Self { socket, remote, psk, conn_id, seq: 0 };
-
         let syn = encode_packet(conn_id, PacketType::Syn, StreamId::Control as u16, 0, Flags::empty(), &[], [0u8; 12]);
-        ctx.socket.send_to(&syn, remote).await?;
-        info!("Sent SYN (conn={})", conn_id);
 
-        let (hdr, _) = ctx.recv_parsed(Duration::from_secs(5)).await?;
-        if hdr.pkt_type != PacketType::SynAck || hdr.conn_id != conn_id {
-            anyhow::bail!("Expected SYN-ACK");
+        // Phase 1: Try UDP
+        let mut found_remote: Option<SocketAddr> = None;
+        let mut socket: Option<UdpSocket> = None;
+
+        for port in &ports {
+            let addr_str = format!("{}:{}", host, port);
+            let remote: SocketAddr = match addr_str.parse() {
+                Ok(a) => a,
+                Err(_) => continue,
+            };
+            let sock = match UdpSocket::bind("0.0.0.0:0").await {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            if sock.send_to(&syn, remote).await.is_err() { continue; }
+            info!("Sent SYN to {} (conn={})", remote, conn_id);
+
+            let mut buf = vec![0u8; lan_link_protocol::frame::MAX_PACKET];
+            match tokio::time::timeout(Duration::from_millis(800), sock.recv_from(&mut buf)).await {
+                Ok(Ok((n, _))) => {
+                    if let Some((hdr, _)) = parse_packet(&buf[..n]) {
+                        if hdr.pkt_type == PacketType::SynAck && hdr.conn_id == conn_id {
+                            info!("SYN-ACK from {}", remote);
+                            found_remote = Some(remote);
+                            socket = Some(sock);
+                            break;
+                        }
+                    }
+                }
+                _ => {
+                    info!("No SYN-ACK from {}:{}, trying next", host, port);
+                }
+            }
         }
 
+        // Phase 2: If UDP failed, try TCP
+        if found_remote.is_none() {
+            info!("UDP probe failed, trying TCP to {}", host);
+            for port in &ports {
+                let addr_str = format!("{}:{}", host, port);
+                match tokio::time::timeout(Duration::from_secs(3), TcpStream::connect(&addr_str)).await {
+                    Ok(Ok(mut stream)) => {
+                        info!("TCP connected to {}", addr_str);
+                        // Send SYN frame: [4-byte BE len][syn packet]
+                        let len_bytes = (syn.len() as u32).to_be_bytes();
+                        stream.write_all(&len_bytes).await?;
+                        stream.write_all(&syn).await?;
+
+                        // Read SYN-ACK frame
+                        let mut len_buf = [0u8; 4];
+                        stream.read_exact(&mut len_buf).await?;
+                        let resp_len = u32::from_be_bytes(len_buf) as usize;
+                        if resp_len > 0 && resp_len < 4096 {
+                            let mut resp = vec![0u8; resp_len];
+                            stream.read_exact(&mut resp).await?;
+                            if let Some((hdr, _)) = parse_packet(&resp) {
+                                if hdr.pkt_type == PacketType::SynAck && hdr.conn_id == conn_id {
+                                    info!("TCP SYN-ACK from {}", addr_str);
+                                    // Create a dummy UDP socket for struct compatibility
+                                    let dummy_socket = UdpSocket::bind("0.0.0.0:0").await?;
+                                    found_remote = Some(addr_str.parse().unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap()));
+                                    // Continue handshake over TCP
+                                    let mut ctx = Self {
+                                        socket: dummy_socket,
+                                        remote: found_remote.unwrap(),
+                                        psk, conn_id, seq: 0,
+                                        tcp: Some(stream),
+                                    };
+                                    ctx.seq += 1;
+                                    let hello = encode_control(conn_id, &ctx.psk, ctx.seq, &ControlMsg::Hello {
+                                        version: lan_link_protocol::frame::PROTOCOL_VERSION,
+                                        capabilities: vec!["exec".into(), "input".into()],
+                                    });
+                                    ctx.tcp_write(&hello).await?;
+                                    // Read HelloAck
+                                    if let Some(data) = ctx.tcp_read_frame(Duration::from_secs(5)).await? {
+                                        let hdr2 = {
+                                            let mut cur = std::io::Cursor::new(&data);
+                                            PacketHeader::decode(&mut cur)
+                                        };
+                                        if let Some(hdr2) = hdr2 {
+                                            let ct = &data[HEADER_SIZE..];
+                                            let end = std::cmp::min(hdr2.payload_len as usize, ct.len());
+                                            if let Some(plain) = crypto::decrypt(&ctx.psk, &hdr2.nonce, &ct[..end]) {
+                                                if let Ok(ControlMsg::HelloAck { version: v, capabilities: caps }) = bincode::deserialize(&plain) {
+                                                    info!("HelloAck v={} caps={:?}", v, caps);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    info!("Connected via TCP to {} (conn={})", addr_str, conn_id);
+                                    return Ok(ctx);
+                                }
+                            }
+                        }
+                        info!("TCP {} did not respond correctly, trying next", addr_str);
+                    }
+                    _ => continue,
+                }
+            }
+        }
+
+        let remote = found_remote.ok_or_else(|| anyhow::anyhow!(
+            "No daemon found at {} (tried UDP+TCP ports {:?})", host, ports
+        ))?;
+        let socket = socket.unwrap();
+        let mut ctx = Self { socket, remote, psk, conn_id, seq: 0, tcp: None };
+
+        // UDP handshake continues
         ctx.seq += 1;
         let hello = encode_control(conn_id, &ctx.psk, ctx.seq, &ControlMsg::Hello {
             version: lan_link_protocol::frame::PROTOCOL_VERSION, capabilities: vec!["exec".into(), "input".into()],
@@ -345,10 +467,42 @@ impl Ctx {
         Ok(ctx)
     }
 
+    /// Write a frame to TCP stream (4-byte BE length prefix + data)
+    async fn tcp_write(&mut self, data: &[u8]) -> anyhow::Result<()> {
+        if let Some(ref mut stream) = self.tcp {
+            let len_bytes = (data.len() as u32).to_be_bytes();
+            stream.write_all(&len_bytes).await?;
+            stream.write_all(data).await?;
+        }
+        Ok(())
+    }
+
+    /// Read a frame from TCP stream
+    async fn tcp_read_frame(&mut self, timeout: Duration) -> anyhow::Result<Option<Vec<u8>>> {
+        if let Some(ref mut stream) = self.tcp {
+            let mut len_buf = [0u8; 4];
+            match tokio::time::timeout(timeout, stream.read_exact(&mut len_buf)).await {
+                Ok(Ok(_)) => {}
+                _ => return Ok(None),
+            }
+            let frame_len = u32::from_be_bytes(len_buf) as usize;
+            if frame_len == 0 || frame_len > 65536 { return Ok(None); }
+            let mut buf = vec![0u8; frame_len];
+            stream.read_exact(&mut buf).await?;
+            Ok(Some(buf))
+        } else {
+            Ok(None)
+        }
+    }
+
     async fn send_control(&mut self, msg: &ControlMsg) -> anyhow::Result<()> {
         self.seq += 1;
         let pkt = encode_control(self.conn_id, &self.psk, self.seq, msg);
-        self.socket.send_to(&pkt, self.remote).await?;
+        if self.tcp.is_some() {
+            self.tcp_write(&pkt).await?;
+        } else {
+            self.socket.send_to(&pkt, self.remote).await?;
+        }
         Ok(())
     }
 
@@ -361,12 +515,34 @@ impl Ctx {
     }
 
     async fn recv_control(&mut self, timeout: Duration) -> anyhow::Result<Option<ControlMsg>> {
-        let (hdr, data) = self.recv_parsed(timeout).await?;
-        if hdr.pkt_type != PacketType::Data || data.is_empty() { return Ok(None); }
-        if let Some(plain) = crypto::decrypt(&self.psk, &hdr.nonce, &data) {
-            return Ok(bincode::deserialize(&plain).ok());
+        if self.tcp.is_some() {
+            // TCP path
+            if let Some(frame) = self.tcp_read_frame(timeout).await? {
+                let hdr = {
+                    let mut cur = std::io::Cursor::new(&frame);
+                    PacketHeader::decode(&mut cur)
+                };
+                if let Some(hdr) = hdr {
+                    if hdr.pkt_type != PacketType::Data { return Ok(None); }
+                    let ct = &frame[HEADER_SIZE..];
+                    let end = std::cmp::min(hdr.payload_len as usize, ct.len());
+                    if let Some(plain) = crypto::decrypt(&self.psk, &hdr.nonce, &ct[..end]) {
+                        return Ok(bincode::deserialize(&plain).ok());
+                    }
+                }
+                Ok(None)
+            } else {
+                Ok(None)
+            }
+        } else {
+            // UDP path
+            let (hdr, data) = self.recv_parsed(timeout).await?;
+            if hdr.pkt_type != PacketType::Data || data.is_empty() { return Ok(None); }
+            if let Some(plain) = crypto::decrypt(&self.psk, &hdr.nonce, &data) {
+                return Ok(bincode::deserialize(&plain).ok());
+            }
+            Ok(None)
         }
-        Ok(None)
     }
 }
 
