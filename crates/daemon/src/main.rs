@@ -19,6 +19,7 @@ use lan_link_protocol::crypto::{self, Psk};
 use lan_link_protocol::frame::{PacketHeader, PacketType, Flags, StreamId, HEADER_SIZE, ControlMsg, NativeCmdType, PROTOCOL_VERSION};
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
 use std::time::{Duration, Instant};
 use tokio::net::{UdpSocket, TcpListener, TcpStream};
@@ -35,6 +36,10 @@ use connection::{Connection, ConnState};
 
 /// TCP connection map: conn_id -> (shared stream, peer_addr)
 type TcpConnMap = Arc<AsyncMutex<HashMap<u64, (Arc<tokio::sync::Mutex<TcpStream>>, SocketAddr)>>>;
+
+/// Global file transfer state: id -> (path, file_handle, size)
+static FILE_TRANSFERS: std::sync::LazyLock<std::sync::Mutex<HashMap<u32, (String, std::fs::File, u64)>>> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
 
 /// Shared daemon state for TCP handler
 struct DaemonState {
@@ -549,9 +554,7 @@ async fn handle_control_tcp(
             info!("TCP FilePush #{}: {} ({} bytes)", id, path, size);
             match std::fs::OpenOptions::new().write(true).create(true).truncate(true).open(&path) {
                 Ok(file) => {
-                    let mut ft = FILE_TRANSFERS.lock().unwrap();
-                    ft.insert(id, (path.clone(), file, size));
-                    drop(ft);
+                    FILE_TRANSFERS.lock().unwrap().insert(id, (path.clone(), file, size));
                     let pkt = build_control_packet_tcp(conn_id, psk, next_seq(), &ControlMsg::FileAck { id, offset: 0 });
                     let _ = tcp_send(tcp_conns, conn_id, &pkt).await;
                 }
@@ -559,26 +562,28 @@ async fn handle_control_tcp(
             }
         }
         ControlMsg::FileChunk { id, offset, data: chunk } => {
-            let mut ft = FILE_TRANSFERS.lock().unwrap();
-            if let Some((_path, file, _size)) = ft.get_mut(&id) {
-                let _ = file.seek(SeekFrom::Start(offset));
-                if let Err(e) = file.write_all(&chunk) {
-                    warn!("TCP FileChunk #{} write error: {}", id, e);
-                    drop(ft);
+            let ack_off = {
+                let mut ft = FILE_TRANSFERS.lock().unwrap();
+                if let Some((_path, file, _size)) = ft.get_mut(&id) {
+                    let _ = file.seek(SeekFrom::Start(offset));
+                    if let Err(e) = file.write_all(&chunk) {
+                        warn!("TCP FileChunk #{} write error: {}", id, e);
+                        return;
+                    }
+                    let ack = offset + chunk.len() as u64;
+                    let done = ack >= *_size;
+                    if done {
+                        info!("TCP FilePush #{} complete: {} bytes", id, ack);
+                        ft.remove(&id);
+                    }
+                    ack
+                } else {
+                    warn!("TCP FileChunk #{}: no active transfer", id);
                     return;
                 }
-                let ack_off = offset + chunk.len() as u64;
-                let done = ack_off >= _size;
-                if done {
-                    info!("TCP FilePush #{} complete: {} bytes", id, ack_off);
-                    ft.remove(&id);
-                }
-                drop(ft);
-                let pkt = build_control_packet_tcp(conn_id, psk, next_seq(), &ControlMsg::FileAck { id, offset: ack_off });
-                let _ = tcp_send(tcp_conns, conn_id, &pkt).await;
-            } else {
-                warn!("TCP FileChunk #{}: no active transfer", id);
-            }
+            };
+            let pkt = build_control_packet_tcp(conn_id, psk, next_seq(), &ControlMsg::FileAck { id, offset: ack_off });
+            let _ = tcp_send(tcp_conns, conn_id, &pkt).await;
         }
         _ => debug!("Unhandled TCP control: {:?}", msg),
     }
@@ -854,9 +859,7 @@ async fn handle_control(
             info!("FilePush #{}: {} ({} bytes)", id, path, size);
             match std::fs::OpenOptions::new().write(true).create(true).truncate(true).open(&path) {
                 Ok(file) => {
-                    let mut ft = FILE_TRANSFERS.lock().unwrap();
-                    ft.insert(id, (path.clone(), file, size));
-                    drop(ft);
+                    let mut ft = FILE_TRANSFERS.lock().unwrap().insert(id, (path.clone(), file, size));
                     let _ = send_control(conn_id, peer, psk, next_seq(), &ControlMsg::FileAck { id, offset: 0 }, &send_socket).await;
                 }
                 Err(e) => {
@@ -875,7 +878,7 @@ async fn handle_control(
                 }
                 let ack_off = offset + chunk.len() as u64;
                 // Check if transfer complete
-                let done = ack_off >= _size;
+                let done = ack_off >= *_size;
                 if done {
                     info!("FilePush #{} complete: {} bytes", id, ack_off);
                     ft.remove(&id);
