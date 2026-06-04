@@ -84,7 +84,8 @@ impl StreamingExec {
             c.arg("/C").arg(cmd);
             c
         } else {
-            let mut c = Command::new("sh");
+            let mut c = Command::new("/bin/sh");
+            c.env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
             c.arg("-c").arg(cmd);
             c
         };

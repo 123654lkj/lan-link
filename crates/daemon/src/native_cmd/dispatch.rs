@@ -197,6 +197,7 @@ pub fn run_native_cmd(cmd: &NativeCmdType) -> (Vec<u8>, Option<i32>) {
         }
         NativeCmdType::ShellExec { cmd, .. } => {
             match std::process::Command::new("/bin/sh")
+                .env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
                 .arg("-c").arg(cmd)
                 .output()
             {
