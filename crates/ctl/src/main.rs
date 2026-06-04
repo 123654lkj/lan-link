@@ -548,7 +548,14 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Cmd::Exec { cmd, timeout } => {
-            let mut ctx = new_ctx!(); nc!(&mut ctx, NativeCmdType::ShellExec { cmd: cmd.join(" "), timeout_secs: timeout as u32 });
+            // Support: exec <addr> <cmd...>  (first token as optional address)
+            let (target_addr, shell_cmd) = if cmd.len() >= 2 && cmd[0].contains(':') {
+                (cmd[0].as_str(), cmd[1..].join(" "))
+            } else {
+                (cli.addr.as_str(), cmd.join(" "))
+            };
+            let mut ctx = Ctx::new(target_addr, &resolved_psk).await?;
+            nc!(&mut ctx, NativeCmdType::ShellExec { cmd: shell_cmd, timeout_secs: timeout as u32 });
         }
         Cmd::Iexec { cmd, timeout } => {
             let mut ctx = new_ctx!();
