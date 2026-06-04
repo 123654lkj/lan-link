@@ -11,9 +11,7 @@ lan-link/
 │   ├── protocol/           # 协议层 — 帧格式、加密、ARQ、流复用
 │   ├── daemon/             # 服务端守护进程 — 连接管理、命令执行
 │   ├── ctl/                # CLI 客户端 — 50+ 管理子命令
-│   ├── gui/                # GUI 客户端 — eframe/egui 桌面应用
 │   ├── shell/              # 命令执行引擎 — 同步/流式执行
-│   ├── input/              # 输入注入 — Linux uinput / Windows SendInput
 │   └── video/              # 视频引擎 — 屏幕捕获与编码（预留/桩）
 ├── deploy/                 # 部署配置（systemd）
 ├── tests/                  # 端到端集成测试（Python）
@@ -25,11 +23,7 @@ lan-link/
 | Crate | 类型 | 二进制/库名 | 职责 |
 |-------|------|-------------|------|
 | `protocol` | 库 | `lan-link-protocol` | 定义所有 crate 共享的协议类型：帧编码（`PacketHeader`）、加密（ChaCha20-Poly1305）、可靠传输（选择性 ARQ）、流复用（`StreamMux`） |
-| `daemon` | 二进制 | `lan-linkd` | UDP 服务端守护进程。管理连接状态机（SYN→SYN-ACK→Established→Heartbeat→Closed），接收 ControlMsg 并调度到 `native_cmd`/`shell`/`input` |
 | `ctl` | 二进制 | `lan-linkctl` | 命令行客户端。50+ 子命令，每个映射到 `NativeCmdType` 或 `ControlMsg::Exec`，通过加密 UDP 与 daemon 通信 |
-| `gui` | 二进制 | `lan-link-gui` | 跨平台桌面 GUI。使用 eframe/egui 框架，提供主机管理、快捷命令、终端输出、历史记录 |
-| `shell` | 库 | `lan-link-shell` | 命令执行引擎。提供 `exec()`（同步）、`exec_with_input()`、`StreamingExec`（流式）三种模式。Unix 用 `sh -c`，Windows 用 `cmd /C` |
-| `input` | 库 | `lan-link-input` | 输入注入。定义 `InputCapture`/`InputInjector` trait。Linux 通过 `evdev` 捕获，`uinput` 注入；Windows 通过 `SendInput` 注入 |
 | `video` | 库 | `lan-link-video` | 视频捕获与编码（预留）。定义 `VideoCapture`/`VideoEncoder` trait。所有实现目前是桩 |
 
 ---
@@ -55,7 +49,6 @@ protocol/
 - **`frame.rs`** — 整个项目的"字典"文件。
   - `PacketHeader`：38 字节定长头部，包含 `conn_id`、`pkt_type`、`flags`、`stream_id`、`seq`、`ack_seq`、`ack_bitmap`、`payload_len`、`nonce`。提供 `encode()`/`decode()` 方法。
   - `PacketType`：枚举（Syn/SynAck/Ack/Data/Rst/Heartbeat）
-  - `StreamId`：枚举（Control/Video/AudioTx/AudioRx/Input/File），附带 `is_reliable()` 方法
   - `Flags`：bitflags（RELIABLE/FRAGMENTED/ORDERED）
   - `ControlMsg`：控制消息枚举，bincode 序列化。包含 `Exec`、`ExecChunk`、`ExecDone`、`ExecStdin`、`NativeCmd`、`NativeSpawn`、`Hello`/`HelloAck`、`KeyEvent`、`MouseMove`、`FilePush`/`FileChunk`/`FileAck`、`VideoStart`/`VideoStop`、`AudioStart`/`AudioStop` 等。
   - `NativeCmdType`：原生命令枚举，约 50 个变体。分为 Filesystem、System、Network、Management 四大类。
@@ -96,7 +89,6 @@ daemon/
   - `Args`：clap 命令行参数（`--port`、`--psk`、`--discovery`）
   - `load_or_generate_psk()`：加载或自动生成 PSK
   - `main()`：绑定 UDP socket，循环 `recv_from()` → `handle_packet_inner()`，每 100ms 轮询，每 5 秒发心跳 + 清理超时连接
-  - `handle_packet_inner()`：按 `PacketType` 分发（Syn → 创建连接 → SynAck；Data → 解密 → 按 StreamId 分发到 `handle_control()` 或 `handle_input_linux()`）
   - `handle_control()`：反序列化 `ControlMsg`，按变体分发（Exec → 启动 StreamingExec；NativeCmd → 调用 run_native_cmd；NativeSpawn → 启动流式；ExecStdin/Signal → 转发）
   - `run_exec_task()`：桥接 `shell::StreamingExec` 的 `std::sync::mpsc` → tokio `mpsc`，用 `tokio::select!` 多路复用
   - `send_control()`：序列化 + 加密 + 发送
@@ -135,14 +127,11 @@ ctl/
   - `drain_exec()`：循环接收 ExecChunk 并打印，直到 ExecDone
   - `handle_iexec()` / `handle_shell()` / `handle_batch()`：交互式/Shell/批处理
 
-### 4. `crates/gui/` — GUI 客户端
 
 ```
-gui/
 ├── Cargo.toml
 ├── build.rs          # 设置 /SUBSYSTEM:WINDOWS 链接标志
 └── src/
-    ├── main.rs       # eframe/egui 应用：UI 布局 + 事件处理
     └── client.rs     # 连接逻辑（SYN→Hello→Exec 流式执行）
 ```
 
@@ -165,27 +154,20 @@ gui/
 shell/
 ├── Cargo.toml
 └── src/
-    └── lib.rs        # exec(), exec_with_input(), StreamingExec
 ```
 
 **文件说明：**
 
 - **`lib.rs`** — 三种执行模式：
   - `exec(cmd, args)`：同步执行，返回 `ExecResult { exit_code, stdout, stderr }`
-  - `exec_with_input(cmd, args, stdin_data)`：同步执行 + 带 stdin 输入
   - `StreamingExec`：流式执行。`spawn(cmd)` 启动进程，内部三个线程（stdout reader、stderr reader、waiter）通过 `std::sync::mpsc` 通道输出
   - `StreamChunk`：`{ stream: u8, data: Vec<u8> }`
   - 跨平台：Unix 用 `sh -c`，Windows 用 `cmd /C`
 
-### 6. `crates/input/` — 输入注入
 
 ```
-input/
 ├── Cargo.toml
 └── src/
-    ├── lib.rs        # InputCapture / InputInjector trait + 数据类型
-    ├── linux.rs      # Linux evdev + uinput 实现
-    └── win.rs        # Windows SendInput 实现
 ```
 
 **文件说明：**
@@ -195,18 +177,9 @@ input/
   - `MouseEvent`：Move / Button / Wheel
   - `MouseButton`：Left / Right / Middle / X1 / X2
   - `Modifiers`：bitflags（CTRL / ALT / SHIFT / WIN）
-  - `MonitorInfo`：显示器信息
-  - `InputCapture` trait：`poll_keys()`、`poll_mouse()`、`cursor_pos()`、`monitors()`
-  - `InputInjector` trait：`inject_key()`、`inject_mouse()`、`set_cursor_pos()`
-  - `BorderWatcher`：跨显示器边界检测
 - **`linux.rs`** — Linux 实现：
-  - `LinuxInputCapture`：通过 `evdev` ioctl 检测键盘/鼠标设备，解析 `input_event`（24 字节）
-  - `find_input_devices()`：遍历 `/dev/input/event*`，使用 `EVIOCGBIT` ioctl 判断设备类型
-  - `LinuxInputInjector`：创建 `/dev/uinput` 虚拟设备（名字 "lan-link-kvm"），写入 `input_event` 结构体
   - `enumerate_drm_monitors()`：读取 `/sys/class/drm/` 枚举显示器
 - **`win.rs`** — Windows 实现（使用 `windows` crate）：
-  - `WinInputCapture`：通过 `GetCursorPos` 轮询鼠标位置
-  - `WinInputInjector`：通过 `SendInput` WinAPI 注入键盘/鼠标事件
 
 ### 7. `crates/video/` — 视频引擎（预留）
 
@@ -232,7 +205,6 @@ pub struct PacketHeader {
     pub conn_id: u64,         // 连接标识
     pub pkt_type: PacketType, // Syn/SynAck/Ack/Data/Rst/Heartbeat
     pub flags: Flags,         // RELIABLE | FRAGMENTED | ORDERED
-    pub stream_id: u16,       // Control(0)/Video(1)/AudioTx(2)/AudioRx(3)/Input(4)/File(5)
     pub seq: u32,             // 序列号（用于可靠传输和 nonce 推导）
     pub ack_seq: u32,         // Piggyback ACK
     pub ack_bitmap: u32,      // 选择 ACK 位图
@@ -320,7 +292,6 @@ pub struct StreamingExec {
 pub struct StreamMux {
     streams: HashMap<u16, MuxStream>,
 }
-// 预创建 6 个流：Control(0), Video(1), AudioTx(2), AudioRx(3), Input(4), File(5)
 ```
 
 ---
@@ -414,21 +385,17 @@ lan-linkctl (ctl) ◄──── protocol ────► lan-linkd (daemon)
        │                                        ├── shell crate (StreamingExec)
        │                                        │       └── protocol (仅类型)
        │                                        │
-       │                                        ├── input crate (Linux uinput)
        │                                        │       └── protocol (仅类型)
        │                                        │
        │                                        └── video crate (预留)
        │
-       └── gui crate ◄──── protocol
                │
                └── shell crate (通过 daemon 间接)
 
 依赖层次（从底层到上层）：
 protocol  ← 无依赖（只有第三方库）
 shell     ← protocol
-input     ← protocol
 video     ← protocol
-daemon    ← protocol + shell + input + video
 ctl       ← protocol
 gui       ← protocol + shell (间接)
 ```

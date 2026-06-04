@@ -1,12 +1,12 @@
 # lan-link — 局域网远程管理工具
 
-lan-link 是一个通过 **UDP 加密通道** 远程管理局域网设备的工具，提供 CLI、GUI 双客户端，支持文件操作、系统管理、远程 shell、服务管理、Docker 操作等 50+ 子命令。
+lan-link 是一个通过 **UDP 加密通道** 远程管理局域网设备的工具，提供 CLI 客户端，支持文件操作、系统管理、远程 shell、服务管理、Docker 操作等 60+ 子命令。
 
 ## 功能特性
 
 - **🔒 端到端加密** — ChaCha20-Poly1305 AEAD 加密，PSK 预共享密钥认证
 - **⚡ 低延迟 UDP 协议** — 自定义帧格式，支持可靠传输（选择性 ARQ）和流复用
-- **🖥️ 双客户端** — CLI 客户端（`lan-linkctl`）和跨平台 GUI 客户端（`lan-link-gui`）
+- **⌨️ 原生命令** — 60+ 系统管理命令（文件系统、进程、网络、服务、日志等）
 - **📂 远程文件操作** — `ls` / `cat` / `tail` / `head` / `find` / `grep` / `cp` / `mv` / `rm` / `chmod` / `chown` / `diff` / `wc` / `du` / `df` / `tree` / `stat` / `touch` / `sed` / `writefile`
 - **🖥️ 远程系统管理** — `ps` / `top` / `kill` / `free` / `uptime` / `hostname` / `uname` / `whoami` / `who` / `last` / `dmesg` / `cpu` / `info` / `lsblk` / `mount`
 - **🌐 远程网络工具** — `netstat` / `ip` / `portscan` / `arp` / `dns`
@@ -15,7 +15,6 @@ lan-link 是一个通过 **UDP 加密通道** 远程管理局域网设备的工�
 - **🐳 Docker 管理** — 容器列表、日志、统计、执行
 - **📁 文件传输** — `push` / `pull` 支持进度显示
 - **🔧 远程 Shell** — 交互式 shell 会话（`shell`）、流式执行（`exec`/`iexec`）、批量命令（`batch`）、定时观察（`watch`）
-- **🖱️ 输入注入** — Linux uinput 键盘/鼠标事件注入
 - **💓 心跳保活** — 5 秒心跳，30 秒超时自动断开
 - **🔍 mDNS 发现** — 自动发现局域网内的 daemon（开发中）
 
@@ -25,8 +24,6 @@ lan-link 是一个通过 **UDP 加密通道** 远程管理局域网设备的工�
 ┌─────────────────────────────────────────────────────────────────────┐
 │                           Client 端                                  │
 │  ┌─────────────────────┐  ┌─────────────────────────────────────┐   │
-│  │   lan-linkctl (CLI) │  │   lan-link-gui (GUI)                │   │
-│  │   clap 子命令解析    │  │   eframe/egui 桌面应用               │   │
 │  └─────────┬───────────┘  └──────────────┬──────────────────────┘   │
 │            │                              │                          │
 │            └──────────┬───────────────────┘                          │
@@ -48,9 +45,6 @@ lan-link 是一个通过 **UDP 加密通道** 远程管理局域网设备的工�
 │  │ 心跳/超时     │  │ net/service  │  │                          │   │
 │  └─────────────┘  └──────────────┘  └──────────────────────────┘   │
 │  ┌─────────────┐  ┌──────────────┐  ┌──────────────────────────┐   │
-│  │ shell crate  │  │ input crate  │  │ video crate (预留)       │   │
-│  │ 命令执行引擎  │  │ uinput注入   │  │ 视频流捕获与编码          │   │
-│  │ 流式输出      │  │ SendInput    │  │                          │   │
 │  └─────────────┘  └──────────────┘  └──────────────────────────┘   │
 └─────────────────────────────────────────────────────────────────────┘
 ```
@@ -88,7 +82,6 @@ export LAN_LINK_PSK=<上面输出的 PSK>
 |--------|------|------|
 | `lan-linkd` | `target/release/lan-linkd` | 守护进程（服务端），需在目标机器上以 root 运行 |
 | `lan-linkctl` | `target/release/lan-linkctl` | 命令行客户端，连接 daemon 执行管理操作 |
-| `lan-link-gui` | `target/release/lan-link-gui` | 跨平台桌面 GUI 客户端 |
 
 ## 配置说明
 
@@ -204,10 +197,7 @@ lan-link/
 │   ├── protocol/              # 协议 crate（帧格式、加密、ARQ、流复用）
 │   ├── daemon/                # 守护进程（binary: lan-linkd）
 │   ├── ctl/                   # CLI 客户端（binary: lan-linkctl）
-│   ├── gui/                   # GUI 客户端（binary: lan-link-gui）
 │   ├── shell/                 # 命令执行引擎
-│   ├── input/                 # 输入注入（Linux uinput / Windows SendInput）
-│   └── video/                 # 视频捕获与编码（预留）
 ```
 
 ## 依赖说明

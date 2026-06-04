@@ -13,24 +13,16 @@
 | 角色 | 操作系统 | 状态 |
 |------|---------|------|
 | **daemon**（服务端） | Linux (x86_64, aarch64) | ✅ 完整支持 |
-| **daemon** | Windows | ⚠️ 有限（no input injection） |
 | **daemon** | macOS | ❌ 未测试 |
 | **ctl**（CLI 客户端） | Linux / Windows / macOS | ✅ 完整支持 |
-| **gui**（GUI 客户端） | Linux (X11/Wayland, egl/glow) | ✅ 支持 |
-| **gui** | Windows | ✅ 支持（需 MSVC 或 GNU 工具链） |
-| **gui** | macOS | ⚠️ 理论上支持（未充分测试） |
 
 ### 系统依赖
 
 **Linux daemon：**
 ```bash
-# uinput 输入注入（可选）
-sudo modprobe uinput
 
-# 需 root 权限以打开 /dev/uinput 和绑定特权端口
 ```
 
-**Linux GUI（可选，仅 `lan-link-gui`）：**
 ```bash
 # 依据图形后端选择
 sudo apt install libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
@@ -64,7 +56,6 @@ cargo build --release
 target/release/
 ├── lan-linkd       # 守护进程（服务端）
 ├── lan-linkctl     # CLI 客户端
-└── lan-link-gui    # GUI 客户端
 ```
 
 ### 部分编译
@@ -76,8 +67,6 @@ cargo build --release -p lan-linkd
 # 仅编译 CLI 客户端
 cargo build --release -p lan-linkctl
 
-# 仅编译 GUI 客户端
-cargo build --release -p lan-link-gui
 
 # 仅编译协议库
 cargo build --release -p lan-link-protocol
@@ -155,11 +144,8 @@ sudo systemctl enable --now lan-linkd
 # 复制 CLI 客户端
 cp target/release/lan-linkctl /usr/local/bin/
 
-# 或复制 GUI 客户端
-cp target/release/lan-link-gui /usr/local/bin/
 ```
 
-**Windows 用户：** 直接双击 `lan-link-gui.exe` 即可使用 GUI。
 
 ---
 
@@ -199,7 +185,6 @@ lan-linkctl --psk <64位hex字符串> info
 export LAN_LINK_PSK=<64位hex字符串>
 lan-linkctl info
 
-# 方式 C：GUI 客户端在"主机管理"面板中填写
 ```
 
 ---
@@ -414,7 +399,6 @@ lan-linkctl status
 | 症状 | 可能原因 | 解决方法 |
 |------|---------|---------|
 | `Permission denied`（绑定端口） | 未以 root 运行 | `sudo lan-linkd` |
-| `Failed to open /dev/uinput` | 无 uinput 权限 | `sudo modprobe uinput && sudo chmod 666 /dev/uinput` |
 | `No such file or directory`（PSK 路径） | 配置目录不存在 | `sudo mkdir -p /etc/lan-link` |
 
 ### 调试模式

@@ -5,15 +5,12 @@
 lan-link 采用 **Client-Daemon（客户端-守护进程）** 架构，所有通信基于 UDP 协议。
 
 > **平台支持说明**：当前 daemon（lan-linkd）仅支持 Linux 平台。Windows 支持为未来计划。
-> 客户端（lan-linkctl / lan-link-gui）可在 Linux 和 Windows 上编译运行。
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
 │                         Client 端                                    │
 │  ┌────────────────────────────┐  ┌──────────────────────────────┐   │
-│  │     lan-linkctl (CLI)      │  │   lan-link-gui (GUI)         │   │
 │  │  ┌──────────────────────┐  │  │  ┌───────────────────────┐   │   │
-│  │  │  clap 子命令解析器     │  │  │  │ eframe/egui UI       │   │   │
 │  │  │  50+ subcommands      │  │  │  │ 快捷命令/终端/主机管理  │   │   │
 │  │  └──────────┬───────────┘  │  │  └───────────┬───────────┘   │   │
 │  │             │              │  │               │               │   │
@@ -56,9 +53,6 @@ lan-link 采用 **Client-Daemon（客户端-守护进程）** 架构，所有通
 │               ┌───────────────┬───────────────┐                     │
 │               ▼               ▼               ▼                     │
 │  ┌──────────────────┐ ┌──────────────┐ ┌──────────────┐            │
-│  │  shell crate     │ │ input crate  │ │ video crate  │            │
-│  │  StreamingExec   │ │ uinput KVM   │ │ 视频捕获/编码  │            │
-│  │  sh -c / cmd /C  │ │ SendInput    │ │ (预留)       │            │
 │  └──────────────────┘ └──────────────┘ └──────────────┘            │
 └─────────────────────────────────────────────────────────────────────┘
 ```
@@ -89,8 +83,6 @@ lan-link 采用 **Client-Daemon（客户端-守护进程）** 架构，所有通
                               bit0=RELIABLE  bit1=FRAGMENTED
                               bit2=ORDERED
  10       2     stream_id    流标识（u16, LE）
-                              0=Control  1=Video  2=AudioTx
-                              3=AudioRx  4=Input  5=File
  12       4     seq          序列号（u32, LE）
  16       4     ack_seq      Piggyback ACK 序列号（u32, LE）
  20       4     ack_bitmap   选择 ACK 位图（32 包窗口, u32, LE）
@@ -173,7 +165,6 @@ bincode::deserialize()     ← 反序列化为 ControlMsg
 
 ### ARQ 可靠传输层
 
-用于 Control、Input、File 流。Video、Audio 流不使用可靠传输。
 
 ```
 协议：选择性重传 ARQ (Selective Repeat ARQ)
@@ -250,9 +241,6 @@ deliver(seq, payload)
 |----------|------|------|------|
 | 0 | Control | ✅ | 控制消息（命令、结果、协商） |
 | 1 | Video | ❌ | 视频帧数据 |
-| 2 | AudioTx | ❌ | 音频发送 |
-| 3 | AudioRx | ❌ | 音频接收 |
-| 4 | Input | ✅ | 输入事件（键盘、鼠标） |
 | 5 | File | ✅ | 文件传输 |
 
 每个流维护独立的 `send_seq` 计数器，互不干扰。可靠流使用 `ReliableSender`/`ReliableReceiver`，不可靠流直接发送。
@@ -317,7 +305,6 @@ Client                           Daemon
   │  4. HelloAck (加密)            │
   │  ControlMsg::HelloAck {        │
   │    version: 1,                 │
-  │    capabilities: ["exec","input"]│
   │  }                             │
   │◄──────────────────────────────┤
   │                                │
@@ -440,9 +427,7 @@ pub fn run_native_cmd(cmd: &NativeCmdType) -> (Vec<u8>, Option<i32>) {
 
 ---
 
-## 输入注入机制
 
-### Linux (evdev + uinput)
 
 ```
 客户端                              daemon
@@ -456,13 +441,9 @@ pub fn run_native_cmd(cmd: &NativeCmdType) -> (Vec<u8>, Option<i32>) {
   ├── (加密) ──── Data 包 ────────►  │
   │                                  │
   │                                  ├── bincode::deserialize
-  │                                  │    → lan_link_input::KeyEvent
   │                                  │
   │                                  ├── injector().lock()
-  │                                  │    → LinuxInputInjector
   │                                  │
-  │                                  ├── fd 写入 input_event 结构
-  │                                  │    struct input_event {
   │                                  │        timeval tv;  // 16 bytes
   │                                  │        u16 type;    // EV_KEY=1
   │                                  │        u16 code;    // scancode
@@ -473,28 +454,20 @@ pub fn run_native_cmd(cmd: &NativeCmdType) -> (Vec<u8>, Option<i32>) {
   │                                  ├── write(fd, &syn, 24) // EV_SYN
   │                                  │
   │                                  ▼
-  │                           /dev/uinput 虚拟设备
   │                           → Linux 输入子系统
   │                           → 应用程序接收按键事件
 ```
 
-#### uinput 设备创建
 
-1. 打开 `/dev/uinput`（需 root 或 `uinput` 组成员）
 2. ioctl 设置设备能力：`UI_SET_EVBIT(EV_KEY)`、`UI_SET_EVBIT(EV_REL)`、`UI_SET_KEYBIT(...)`、`UI_SET_RELBIT(...)`
-3. 写入 `UinputUserDev` 结构体（设备名：`lan-link-kvm`）
 4. ioctl `UI_DEV_CREATE` 创建设备
-5. 之后向 fd 写入 `input_event` 结构体即可注入输入
 
 #### evdev 捕获
 
-1. 遍历 `/dev/input/event*` 设备文件
 2. 使用 `EVIOCGBIT` ioctl 查询设备能力
 3. 识别键盘设备（支持 EV_KEY 且包含 KEY_A 等按键码）
 4. 识别鼠标设备（支持 EV_REL 且包含 REL_X/REL_Y）
-5. 以非阻塞方式读取 24 字节的 `input_event` 结构
 
-### Windows (SendInput) [未来计划]
 
 ```
 客户端                              daemon (Windows)
@@ -507,11 +480,8 @@ pub fn run_native_cmd(cmd: &NativeCmdType) -> (Vec<u8>, Option<i32>) {
   │                                  │
   ├── (加密) ──── Data 包 ────────►  │
   │                                  │
-  │                                  ├── WinInputInjector
   │                                  │
-  │                                  ├── SendInput(INPUT)
   │                                  │    struct INPUT {
-  │                                  │        type: INPUT_KEYBOARD,
   │                                  │        ki: {
   │                                  │            wVk: VK_A,
   │                                  │            wScan: 0x1E,

@@ -5,7 +5,6 @@
 daemon ──┬── protocol (frame, crypto, reliable, stream)
          ├── shell   (exec, ExecResult)
          ├── video   (VideoCapture, VideoEncoder, DxgiCapture, NvencEncoder)
-         ├── input   (InputCapture, InputInjector, BorderWatcher, MonitorInfo)
          └── discovery (mDNS stub)
 
 ctl ─────┬── protocol
@@ -20,7 +19,6 @@ lan_link_protocol::
     MAX_PAYLOAD: usize = 1400
     MAX_PACKET: usize = 1454
     PacketType { Syn, SynAck, Ack, Data, Rst, Heartbeat }
-    StreamId { Control=0, Video=1, AudioTx=2, AudioRx=3, Input=4, File=5 }
     Flags { RELIABLE, FRAGMENTED, ORDERED }
     PacketHeader { conn_id, pkt_type, flags, stream_id, seq, ack_seq, ack_bitmap, payload_len, nonce }
       ::encode(buf) ::decode(buf) -> Option<Self>
@@ -29,7 +27,6 @@ lan_link_protocol::
       ExecOutput{id:u32, data:Vec<u8>, exit_code:Option<i32>}
       FilePush{id, path, size} / FileChunk{id, offset, data} / FileAck{id, offset}
       KeyEvent{down:bool, scancode:u16, vk:u16}
-      MouseMove{dx:i16, dy:i16} / MouseButton{button:u8, down:bool} / MouseWheel{delta:i16}
       VideoStart{width, height, fps, bitrate_kbps} / VideoStop
       AudioStart{sample_rate, channels} / AudioStop
       Hello{version:u16, capabilities:Vec<String>} / HelloAck
@@ -59,28 +56,16 @@ lan_link_protocol::
 ```
 lan_link_shell::
   exec(cmd:&str, args:&[&str]) -> anyhow::Result<ExecResult>
-  exec_with_input(cmd, args, stdin_data) -> anyhow::Result<ExecResult>
   ExecResult { exit_code:i32, stdout:String, stderr:String }
 ```
 
-## input crate 导出
 ```
-lan_link_input::
   KeyEvent { down:bool, scancode:u16, vk:u16, modifiers:Modifiers }
-  MouseEvent::Move{dx,dy,absolute} | Button{button,down} | Wheel{delta,horizontal}
-  MouseButton::Left|Right|Middle|X1|X2
   Modifiers { CTRL, ALT, SHIFT, WIN }
-  MonitorInfo { index, name, x, y, width, height, is_primary }
-  InputCapture trait: poll_keys(), poll_mouse(), cursor_pos(), monitors()
-  InputInjector trait: inject_key(), inject_mouse(), set_cursor_pos()
-  BorderWatcher::new(remote_monitor:u32)
     ::check(x, y, monitors) -> Option<bool>  // Some(true)=进入remote, Some(false)=离开
     ::is_on_remote() -> bool
   // Windows:
-  WinInputCapture::new() ::register(hwnd)
-  WinInputInjector::new()
   // Linux (stub):
-  LinuxInputCapture / LinuxInputInjector
 ```
 
 ## video crate 导出
@@ -121,7 +106,6 @@ lan-linkctl (bin):
 
 ## 编译依赖 (Cargo.toml)
 ```
-workspace members: protocol, shell, video, input, daemon, ctl
 (音频crate暂移除，因cpal→cmake→dlltool依赖问题)
 
 关键外部依赖:
@@ -129,6 +113,5 @@ workspace members: protocol, shell, video, input, daemon, ctl
   daemon:   tokio, clap, anyhow, hex
   ctl:      tokio, clap, anyhow, hex
   shell:    tokio, anyhow
-  input:    bitflags, windows (Win32 UI/GDI)
   video:    (待加DXGI/NVENC依赖)
 ```

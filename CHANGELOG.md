@@ -86,6 +86,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - 新增 code-structure.md — 代码结构详细说明
 - 重写 README.md — 完整项目文档
 
+
+## [0.2.0] - 2026-06-04
+
+### Removed
+
+- **GUI 客户端** — 整个 `crates/gui/` 目录删除，lan-link 不再提供图形界面
+- **输入注入模块** — 删除 `crates/input/` 目录及所有键盘/鼠标事件注入代码
+- **input 残留代码** — 从 `daemon/src/main.rs` 删除 `handle_input_linux`、`INJECTOR`、`INJECT_COUNT`
+- **弃用命令** — 从 CLI 移除 `key`、`mouse`、`video` 三个已弃用命令及 `MouseAction` 枚举
+
+### Fixed
+
+- **nonce 加密 bug** — `encode_packet` 将 header.nonce 设为全零，导致所有数据包解密失败。改将加密用的 nonce 传入 header
+- **native_cmd.rs 模块化** — 单文件拆分为 `native_cmd/` 目录（dispatch + 9个子模块）
+
+### Changed
+
+- 版本号从 `0.1.0` 升级到 `0.2.0`
+- lan-linkctl 和 lan-linkd 统一版本号
+
 ## [0.1.0] - 2025-04-06
 
 ### Added
