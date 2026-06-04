@@ -44,6 +44,31 @@ enum ExecCmd {
 type ExecMap = Arc<AsyncMutex<HashMap<u32, tokio::sync::mpsc::UnboundedSender<ExecCmd>>>>;
 fn new_exec_map() -> ExecMap { Arc::new(AsyncMutex::new(HashMap::new())) }
 
+/// How to send back to a peer — UDP or TCP (framed with 2-byte len prefix).
+#[derive(Clone)]
+enum PeerSender {
+    Udp(Arc<UdpSocket>),
+    Tcp(Arc<tokio::sync::Mutex<TcpStream>>),
+}
+
+impl PeerSender {
+    async fn send_to(&self, data: &[u8], peer: SocketAddr) {
+        match self {
+            PeerSender::Udp(sock) => { let _ = sock.send_to(data, peer).await; }
+            PeerSender::Tcp(stream) => {
+                let len = (data.len() as u16).to_be_bytes();
+                let mut frame = Vec::with_capacity(2 + data.len());
+                frame.extend_from_slice(&len);
+                frame.extend_from_slice(data);
+                let _ = stream.lock().await.write_all(&frame).await;
+            }
+        }
+    }
+}
+
+/// Channel item: raw bytes from a TCP peer + the sender to use for replies.
+type TcpRxItem = (Vec<u8>, SocketAddr, PeerSender);
+
 const PSK_PATH: &str = "/etc/lan-link/psk";
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 const TIMEOUT: Duration = Duration::from_secs(30);
@@ -298,25 +323,30 @@ async fn main() -> anyhow::Result<()> {
 
     let hb_socket = UdpSocket::bind("0.0.0.0:0").await?;
     let send_socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
-    let tcp_peers: Arc<tokio::sync::Mutex<HashMap<SocketAddr, TcpStream>>> = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let tcp_peers: Arc<tokio::sync::Mutex<HashMap<SocketAddr, PeerSender>>> = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let (tcp_tx, mut tcp_rx) = tokio::sync::mpsc::unbounded_channel::<TcpRxItem>();
     let mut connections: HashMap<u64, Connection> = HashMap::new();
     let mut buf = vec![0u8; lan_link_protocol::frame::MAX_PACKET];
     let exec_map: ExecMap = new_exec_map();
     let mut last_hb = Instant::now();
     let mut rate_limiter = RateLimiter::new();
 
-    // TCP accept 后台任务
+    // TCP accept 后台任务：每连接 spawn 独立的 read 循环
     if let Some(listener) = tcp_listener.clone() {
         let tcp_peers_clone = tcp_peers.clone();
-        let psk_clone = psk.clone();
-        let exec_map_clone = exec_map.clone();
-        let send_socket_clone = send_socket.clone();
+        let tcp_tx_clone = tcp_tx.clone();
         tokio::spawn(async move {
             loop {
                 match listener.accept().await {
                     Ok((stream, peer)) => {
                         info!("TCP connection from {}", peer);
-                        tcp_peers_clone.lock().await.insert(peer, stream);
+                        let tcp_stream = Arc::new(tokio::sync::Mutex::new(stream));
+                        let sender = PeerSender::Tcp(tcp_stream.clone());
+                        tcp_peers_clone.lock().await.insert(peer, sender);
+                        let tx = tcp_tx_clone.clone();
+                        tokio::spawn(async move {
+                            tcp_read_loop(tcp_stream, peer, tx).await;
+                        });
                     }
                     Err(e) => warn!("TCP accept error: {}", e),
                 }
@@ -325,13 +355,26 @@ async fn main() -> anyhow::Result<()> {
     }
 
     loop {
-        match tokio::time::timeout(Duration::from_millis(100), socket.recv_from(&mut buf)).await {
-            Ok(Ok((n, peer))) => {
-                debug!("recv {} bytes from {}", n, peer);
-                handle_packet_inner(&mut buf[..n], peer, &mut connections, &psk, &exec_map, send_socket.clone(), &mut rate_limiter).await;
+        tokio::select! {
+            // UDP recv
+            result = tokio::time::timeout(Duration::from_millis(100), socket.recv_from(&mut buf)) => {
+                match result {
+                    Ok(Ok((n, peer))) => {
+                        debug!("recv {} bytes from UDP {}", n, peer);
+                        let sender = PeerSender::Udp(send_socket.clone());
+                        handle_packet_inner(&mut buf[..n], peer, &mut connections, &psk, &exec_map, sender, &mut rate_limiter).await;
+                    }
+                    Ok(Err(e)) => warn!("recv error: {}", e),
+                    Err(_) => {}
+                }
             }
-            Ok(Err(e)) => warn!("recv error: {}", e),
-            Err(_) => {}
+            // TCP channel recv
+            maybe_frame = tcp_rx.recv() => {
+                if let Some((mut data, peer, sender)) = maybe_frame {
+                    debug!("recv {} bytes from TCP {}", data.len(), peer);
+                    handle_packet_inner(&mut data, peer, &mut connections, &psk, &exec_map, sender, &mut rate_limiter).await;
+                }
+            }
         }
 
         let now = Instant::now();
@@ -354,9 +397,39 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
+/// TCP per-connection read loop: reads length-prefixed frames, forwards to the main event loop
+/// via the unbounded channel so all packet processing stays single-threaded.
+async fn tcp_read_loop(
+    tcp_stream: Arc<tokio::sync::Mutex<TcpStream>>,
+    peer: SocketAddr,
+    tx: tokio::sync::mpsc::UnboundedSender<TcpRxItem>,
+) {
+    let sender = PeerSender::Tcp(tcp_stream.clone());
+    let mut len_buf = [0u8; 2];
+    loop {
+        if tcp_stream.lock().await.read_exact(&mut len_buf).await.is_err() {
+            debug!("TCP peer {} disconnected", peer);
+            break;
+        }
+        let pkt_len = u16::from_be_bytes(len_buf) as usize;
+        if pkt_len == 0 || pkt_len > lan_link_protocol::frame::MAX_PACKET {
+            warn!("TCP bad pkt_len={} from {}", pkt_len, peer);
+            break;
+        }
+        let mut pkt_buf = vec![0u8; pkt_len];
+        if tcp_stream.lock().await.read_exact(&mut pkt_buf).await.is_err() {
+            debug!("TCP peer {} read packet failed", peer);
+            break;
+        }
+        if tx.send((pkt_buf, peer, sender.clone())).is_err() {
+            break; // main loop gone
+        }
+    }
+}
+
 async fn handle_packet_inner(
     data: &mut [u8], peer: SocketAddr, connections: &mut HashMap<u64, Connection>, psk: &Psk, exec_map: &ExecMap,
-    send_socket: Arc<UdpSocket>, rate_limiter: &mut RateLimiter) {
+    sender: PeerSender, rate_limiter: &mut RateLimiter) {
     let mut cursor = std::io::Cursor::new(&*data);
     let header = match PacketHeader::decode(&mut cursor) {
         Some(h) => h, None => { warn!("Bad header from {}", peer); return; }
@@ -384,7 +457,7 @@ async fn handle_packet_inner(
                 // Same peer: refresh
                 info!("SYN refresh from {} (conn={})", peer, conn_id);
                 let syn_ack = Connection::build_syn_ack(conn_id);
-                let _ = send_socket.send_to(&syn_ack, peer).await;
+                let _ = sender.send_to(&syn_ack, peer).await;
                 return;
             }
             info!("SYN from {} (conn={})", peer, conn_id);
@@ -392,7 +465,7 @@ async fn handle_packet_inner(
             conn.state = ConnState::Established;
             let syn_ack = Connection::build_syn_ack(conn_id);
             connections.insert(conn_id, conn);
-            let _ = send_socket.send_to(&syn_ack, peer).await;
+            let _ = sender.send_to(&syn_ack, peer).await;
         }
         PacketType::SynAck => {
             info!("SYN-ACK from {} (conn={})", peer, conn_id);
@@ -429,7 +502,7 @@ async fn handle_packet_inner(
                 }
                 let ctrl_seq = connections.get(&conn_id).map(|c| Arc::clone(&c.send_seq));
                 if let Some(seq) = ctrl_seq {
-                    handle_control(&plaintext, conn_id, peer, psk, &exec_map, send_socket.clone(), seq).await;
+                    handle_control(&plaintext, conn_id, peer, psk, &exec_map, sender.clone(), seq).await;
                 }
         }
             }
@@ -441,7 +514,7 @@ async fn handle_packet_inner(
                 }
                 conn.last_activity = Instant::now();
                 let hb = Connection::build_heartbeat(conn_id);
-                let _ = send_socket.send_to(&hb, conn.peer).await;
+                let _ = sender.send_to(&hb, conn.peer).await;
             }
         }
         PacketType::Rst => { connections.remove(&conn_id); }
@@ -454,7 +527,7 @@ async fn handle_packet_inner(
 async fn handle_control(
     data: &[u8], conn_id: u64, peer: SocketAddr,
     psk: &Psk, exec_map: &ExecMap,
-    send_socket: Arc<UdpSocket>,
+    sender: PeerSender,
     ctrl_seq: Arc<AtomicU64>,
 ) {
     let msg: ControlMsg = match bincode::deserialize(data) {
@@ -467,7 +540,7 @@ async fn handle_control(
             let se = match lan_link_shell::StreamingExec::spawn(&cmd) {
                 Ok(s) => s,
                 Err(e) => {
-                    let _ = send_control(conn_id, peer, psk, next_seq(), &ControlMsg::ExecDone { id, exit_code: None }, &send_socket).await;
+                    let _ = send_control(conn_id, peer, psk, next_seq(), &ControlMsg::ExecDone { id, exit_code: None }, &sender).await;
                     warn!("Exec #{} spawn failed: {}", id, e);
                     return;
                 }
@@ -476,8 +549,8 @@ async fn handle_control(
             exec_map.lock().await.insert(id, cmd_tx);
             let psk2 = *psk;
             let seq_clone = Arc::clone(&ctrl_seq);
-            tokio::spawn(run_exec_task(id, se, cmd_rx, conn_id, peer, psk2, send_socket.clone(), seq_clone));
-            let _ = send_control(conn_id, peer, psk, next_seq(), &ControlMsg::ExecStarted { id }, &send_socket).await;
+            tokio::spawn(run_exec_task(id, se, cmd_rx, conn_id, peer, psk2, sender.clone(), seq_clone));
+            let _ = send_control(conn_id, peer, psk, next_seq(), &ControlMsg::ExecStarted { id }, &sender).await;
         }
         ControlMsg::NativeSpawn { id, cmd } => {
             info!("NativeSpawn #{}: {:?}", id, cmd);
@@ -492,14 +565,14 @@ async fn handle_control(
                 }
                 _ => {
                     warn!("NativeSpawn #{}: unsupported cmd variant", id);
-                    let _ = send_control(conn_id, peer, psk, next_seq(), &ControlMsg::ExecDone { id, exit_code: None }, &send_socket).await;
+                    let _ = send_control(conn_id, peer, psk, next_seq(), &ControlMsg::ExecDone { id, exit_code: None }, &sender).await;
                     return;
                 }
             };
             let se = match lan_link_shell::StreamingExec::spawn(&cmd_str) {
                 Ok(s) => s,
                 Err(e) => {
-                    let _ = send_control(conn_id, peer, psk, next_seq(), &ControlMsg::ExecDone { id, exit_code: None }, &send_socket).await;
+                    let _ = send_control(conn_id, peer, psk, next_seq(), &ControlMsg::ExecDone { id, exit_code: None }, &sender).await;
                     warn!("NativeSpawn #{} spawn failed: {}", id, e);
                     return;
                 }
@@ -508,8 +581,8 @@ async fn handle_control(
             exec_map.lock().await.insert(id, cmd_tx);
             let psk2 = *psk;
             let seq_clone = Arc::clone(&ctrl_seq);
-            tokio::spawn(run_exec_task(id, se, cmd_rx, conn_id, peer, psk2, send_socket.clone(), seq_clone));
-            let _ = send_control(conn_id, peer, psk, next_seq(), &ControlMsg::ExecStarted { id }, &send_socket).await;
+            tokio::spawn(run_exec_task(id, se, cmd_rx, conn_id, peer, psk2, sender.clone(), seq_clone));
+            let _ = send_control(conn_id, peer, psk, next_seq(), &ControlMsg::ExecStarted { id }, &sender).await;
         }
         ControlMsg::ExecStdin { id, data, close } => {
             let map = exec_map.lock().await;
@@ -529,18 +602,18 @@ async fn handle_control(
                 warn!("Incompatible protocol version: client v{}, daemon v{}", version, PROTOCOL_VERSION);
                 return;
             }
-            let _ = send_control(conn_id, peer, psk, next_seq(), &ControlMsg::HelloAck { version: PROTOCOL_VERSION, capabilities: vec!["exec".into(), "input".into()] }, &send_socket).await;
+            let _ = send_control(conn_id, peer, psk, next_seq(), &ControlMsg::HelloAck { version: PROTOCOL_VERSION, capabilities: vec!["exec".into(), "input".into()] }, &sender).await;
         }
         ControlMsg::NativeCmd { id, cmd } => {
             let psk2 = *psk;
-            let sock2 = send_socket.clone();
+            let sender2 = sender.clone();
             let peer2 = peer;
             // Run in blocking thread to not stall the async event loop
             let (out, exit) = tokio::task::spawn_blocking(move || {
                 native_cmd::run_native_cmd(&cmd)
             }).await.unwrap_or((b"NativeCmd: spawn_blocking failed\n".to_vec(), Some(1)));
-            let _ = send_control(conn_id, peer2, &psk2, next_seq(), &ControlMsg::ExecChunk { id, stream: 0, data: out }, &sock2).await;
-            let _ = send_control(conn_id, peer2, &psk2, next_seq(), &ControlMsg::ExecDone { id, exit_code: exit }, &sock2).await;
+            let _ = send_control(conn_id, peer2, &psk2, next_seq(), &ControlMsg::ExecChunk { id, stream: 0, data: out }, &sender2).await;
+            let _ = send_control(conn_id, peer2, &psk2, next_seq(), &ControlMsg::ExecDone { id, exit_code: exit }, &sender2).await;
         }
 
         _ => debug!("Unhandled control: {:?}", msg),
@@ -558,7 +631,7 @@ async fn run_exec_task(
     conn_id: u64,
     peer: SocketAddr,
     psk: Psk,
-    send_socket: Arc<UdpSocket>,
+    send_socket: PeerSender,
     ctrl_seq: Arc<AtomicU64>,
 ) {
     // Bridge the std::sync::mpsc channels from StreamingExec to tokio channels,
@@ -611,7 +684,7 @@ async fn run_exec_task(
     }
 }
 
-async fn send_control(conn_id: u64, peer: SocketAddr, psk: &Psk, seq: u64, msg: &ControlMsg, send_socket: &UdpSocket) {
+async fn send_control(conn_id: u64, peer: SocketAddr, psk: &Psk, seq: u64, msg: &ControlMsg, sender: &PeerSender) {
     let payload = bincode::serialize(msg).unwrap();
     let seq32 = seq as u32;
     let nonce = crypto::make_nonce(conn_id, seq32);
@@ -620,5 +693,5 @@ async fn send_control(conn_id: u64, peer: SocketAddr, psk: &Psk, seq: u64, msg: 
         Err(_) => { warn!("encrypt failed for conn {}", conn_id); return; }
     };
     let packet = Connection::build_encrypted_data(conn_id, StreamId::Control as u16, seq32, Flags::RELIABLE, &encrypted, nonce);
-    let _ = send_socket.send_to(&packet, peer).await;
+    let _ = sender.send_to(&packet, peer).await;
 }

@@ -372,6 +372,9 @@ impl Ctx {
         let stream = TcpStream::connect(remote).await?;
         let syn = encode_packet(conn_id, PacketType::Syn, StreamId::Control as u16, 0, Flags::empty(), &[], [0u8; 12]);
         let mut sock = stream;
+        // Send SYN with 2-byte length prefix (same framing as send_raw)
+        let len = (syn.len() as u16).to_be_bytes();
+        sock.write_all(&len).await?;
         sock.write_all(&syn).await?;
         info!("Sent SYN (TCP conn={})", conn_id);
 
