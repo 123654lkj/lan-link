@@ -1,0 +1,49 @@
+# Task E Execution Log — lan-link v0.4.1 Release
+# Executed: 2026-06-04
+# cwd: /opt/lan-link
+
+=== Step 1: git log --oneline -3 ===
+1e2dddc fix: exec exit 127
+a9eade4  fix: exec exit 127 - ShellExec PATH
+6b9bf63 feat: daemon VPN DHT bootstrap integration
+
+=== Step 2: gh release list | head ===
+v0.4.0 - DHT + bootstrap mesh 组网	Latest	v0.4.0	2026-06-04T08:15:18Z
+v0.3.1 - 端口避让 + 静态编译		v0.3.1	2026-06-04T07:28:26Z
+=> v0.4.0 已确认存在
+
+=== Step 3: (信息确认) ===
+即将发布 v0.4.1，附带 musl 静态二进制成品
+
+=== Step 4: cargo build --target x86_64-unknown-linux-musl --release -p lan-linkd -p lan-linkctl ===
+Finished `release` profile [optimized] target(s) in 3m 25s
+=> 编译成功
+
+=== Step 5: tar -czf /tmp/lan-link-v0.4.1-musl.tar.gz ... ===
+-rw-r--r-- 1 root root 2.4M lan-link-v0.4.1-musl.tar.gz
+=> 打包成功 (2.4M)
+
+=== Step 6: git tag -f v0.4.1 ===
+(无输出，成功)
+
+=== Step 7: gh release create ... ===
+(先执行 Step 8 push tag 解决 gh 要求 tag 已推送的问题)
+Release URL: https://github.com/123654lkj/lan-link/releases/tag/v0.4.1
+Asset: lan-link-v0.4.1-musl.tar.gz
+=> Release 创建成功
+
+=== Step 8: git push origin v0.4.1 -f ===
+To https://github.com/123654lkj/lan-link.git
+ * [new tag]         v0.4.1 -> v0.4.1
+=> 推送成功
+
+=== Final Verification ===
+gh release view v0.4.1:
+  title:      v0.4.1 - exit 127 fix + DHT
+  tag:        v0.4.1
+  draft:      false
+  prerelease: false
+  author:     123654lkj
+  asset:      lan-link-v0.4.1-musl.tar.gz
+
+=== RESULT: ALL 8 STEPS COMPLETED SUCCESSFULLY ===
