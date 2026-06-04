@@ -6,7 +6,6 @@ members = [
     "crates/video",
     "crates/daemon",
     "crates/ctl",
-    "crates/gui",
 ]
 
 [workspace.package]
