@@ -373,17 +373,17 @@ impl Ctx {
                     }
                 }
                 _ => {
-                    info!("No SYN-ACK from {}:{}, trying next", host, port);
+                    info!("No SYN-ACK from {}:{}", host, port);
                 }
             }
         }
 
-        // Phase 2: If UDP failed, try TCP
+        // Phase 2: If UDP failed, try TCP (only the first/fixed port)
         if found_remote.is_none() {
-            info!("UDP probe failed, trying TCP to {}", host);
-            for port in &ports {
-                let addr_str = format!("{}:{}", host, port);
-                match tokio::time::timeout(Duration::from_secs(3), TcpStream::connect(&addr_str)).await {
+            let tcp_port = fixed_port.unwrap_or(PORT_CANDIDATES[0]);
+            let addr_str = format!("{}:{}", host, tcp_port);
+            info!("UDP probe failed, trying TCP to {}", addr_str);
+            match tokio::time::timeout(Duration::from_secs(3), TcpStream::connect(&addr_str)).await {
                     Ok(Ok(mut stream)) => {
                         info!("TCP connected to {}", addr_str);
                         // Send SYN frame: [4-byte BE len][syn packet]
@@ -438,11 +438,10 @@ impl Ctx {
                                 }
                             }
                         }
-                        info!("TCP {} did not respond correctly, trying next", addr_str);
+                        info!("TCP {} did not respond correctly", addr_str);
                     }
-                    _ => continue,
+                    _ => {},
                 }
-            }
         }
 
         let remote = found_remote.ok_or_else(|| anyhow::anyhow!(

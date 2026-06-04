@@ -131,11 +131,11 @@ impl RateLimiter {
 struct Args {
     #[arg(short, long, default_value = "9876", help = "监听端口")] port: u16,
     #[arg(short, long, help = "手动指定 PSK hex（不指定则自动生成/读取）")] psk: Option<String>,
-    #[arg(long, default_value = "true", help = "启用 mDNS 发现")] discovery: bool,
+    #[arg(long, default_value_t = true, help = "启用 mDNS 发现")] discovery: bool,
     #[arg(long, default_value = "9877", help = "VPN 中继端口")] vpn_port: u16,
     #[arg(long, help = "本节点名称（启用 VPN 时必需）")] node_name: Option<String>,
     #[arg(long, help = "启用 VPN 模块")] vpn: bool,
-    #[arg(long, default_value = "true", help = "同时监听 TCP（同端口）")] tcp: bool,
+    #[arg(long, default_value_t = true, help = "同时监听 TCP（同端口）")] tcp: bool,
 }
 
 fn load_or_generate_psk(args: &Args) -> Psk {
