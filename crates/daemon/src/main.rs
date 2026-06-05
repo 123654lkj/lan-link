@@ -23,7 +23,6 @@ use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
 use std::time::{Duration, Instant};
 use tokio::net::{UdpSocket, TcpListener, TcpStream};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{info, warn, debug};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -451,7 +450,7 @@ async fn tcp_send(tcp_conns: &TcpConnMap, conn_id: u64, data: &[u8]) -> anyhow::
 async fn handle_control_tcp(
     data: &[u8], conn_id: u64, peer: SocketAddr,
     psk: &Psk, exec_map: &ExecMap,
-    send_socket: Arc<UdpSocket>,
+    _send_socket: Arc<UdpSocket>,
     ctrl_seq: Arc<AtomicU64>,
     tcp_conns: &TcpConnMap,
 ) {
@@ -523,7 +522,7 @@ async fn handle_control_tcp(
             info!("TCP Exec #{}: {}", id, cmd);
             let se = match lan_link_shell::StreamingExec::spawn(cmd) {
                 Ok(s) => s,
-                Err(e) => {
+                Err(_e) => {
                     let pkt = build_control_packet_tcp(conn_id, psk, next_seq(), &ControlMsg::ExecDone { id, exit_code: None });
                     let _ = tcp_send(tcp_conns, conn_id, &pkt).await;
                     return;
@@ -859,7 +858,7 @@ async fn handle_control(
             info!("FilePush #{}: {} ({} bytes)", id, path, size);
             match std::fs::OpenOptions::new().write(true).create(true).truncate(true).open(&path) {
                 Ok(file) => {
-                    let mut ft = FILE_TRANSFERS.lock().unwrap().insert(id, (path.clone(), file, size));
+                    let _ft = FILE_TRANSFERS.lock().unwrap().insert(id, (path.clone(), file, size));
                     let _ = send_control(conn_id, peer, psk, next_seq(), &ControlMsg::FileAck { id, offset: 0 }, &send_socket).await;
                 }
                 Err(e) => {

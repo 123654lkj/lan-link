@@ -696,7 +696,7 @@ async fn main() -> anyhow::Result<()> {
                 info!("Batch: {} commands from {}", lines.len(), file);
                 let mut ok = 0u32;
                 for i in 0..lines.len() {
-                    let line = lines[i].clone();
+                    let line = lines[i];
                     println!("--- [{}/{}] {} ---", i + 1, lines.len(), line);
                     native_run(&mut ctx, (i + 1) as u32, NativeCmdType::ShellExec { cmd: line.to_string(), timeout_secs: timeout as u32 }, timeout).await?;
                     ok += 1;

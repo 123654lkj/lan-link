@@ -42,6 +42,7 @@ struct TuiApp {
     completions: Vec<String>,
     /// 显示补全菜单
     show_completions: bool,
+    #[allow(dead_code)]
     completion_idx: usize,
 }
 
@@ -243,7 +244,7 @@ fn whoami() -> String {
 }
 
 /// 运行 TUI
-pub async fn run_tui(psk_hex: String, _default_addr: String) -> anyhow::Result<()> {
+pub async fn run_tui(_psk_hex: String, _default_addr: String) -> anyhow::Result<()> {
     enable_raw_mode()?;
     let mut stdout = stdout();
     execute!(stdout, EnterAlternateScreen)?;

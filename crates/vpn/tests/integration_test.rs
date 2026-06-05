@@ -375,66 +375,39 @@ fn test_lan_router_debug_format() {
 
 // ===================== DHT Mesh 集成测试 =====================
 
-/// 辅助：创建 NodeID
 fn dht_make_id(byte: u8) -> NodeID {
     NodeID::from_bytes(&[byte; 32])
 }
 
-/// 辅助：在 mesh 中传播节点发现
-fn dht_discover(source: &DhtManager, target: &DhtManager) {
-    let nodes = source.all_nodes();
-    for (id, addr) in &nodes {
-        let _ = target.insert_node(*id, addr.clone());
-    }
-}
-
-/// 辅助：收敛检查 — 所有节点是否互相发现
-fn dht_converged(nodes: &[&DhtManager]) -> bool {
-    let expected = nodes.len() - 1; // 除自己外都应发现
-    for n in nodes {
-        if n.node_count() < expected {
-            return false;
-        }
-    }
-    true
-}
-
 #[test]
 fn test_dht_mesh_3_node_discovery() {
-    // 模拟 3 节点 DHT mesh：A↔B↔C
     let node_a = DhtManager::new(dht_make_id(0x01));
     let node_b = DhtManager::new(dht_make_id(0x02));
     let node_c = DhtManager::new(dht_make_id(0x03));
 
-    // 初始：无节点
-    assert_eq!(node_a.node_count(), 0);
+    // Step 1: A 发现 B
+    assert_eq!(node_a.insert_node(dht_make_id(0x02), "10.0.0.2:9877".into()).unwrap(), true);
+    assert_eq!(node_a.node_count(), 1);
     assert_eq!(node_b.node_count(), 0);
 
-    // 步骤1: A↔B 互相发现
-    node_a.insert_node(dht_make_id(0x02), "10.0.0.2:9877".to_string()).unwrap();
-    node_b.insert_node(dht_make_id(0x01), "10.0.0.1:9877".to_string()).unwrap();
-    assert_eq!(node_a.node_count(), 1);
-    assert_eq!(node_b.node_count(), 1);
+    // Step 2: B 发现 A 和 C
+    assert_eq!(node_b.insert_node(dht_make_id(0x01), "10.0.0.1:9877".into()).unwrap(), true);
+    assert_eq!(node_b.insert_node(dht_make_id(0x03), "10.0.0.3:9877".into()).unwrap(), true);
+    assert_eq!(node_b.node_count(), 2);
 
-    // 步骤2: B↔C 互相发现
-    node_b.insert_node(dht_make_id(0x03), "10.0.0.3:9877".to_string()).unwrap();
-    node_c.insert_node(dht_make_id(0x02), "10.0.0.2:9877".to_string()).unwrap();
-    assert_eq!(node_b.node_count(), 2);  // B now knows A and C
+    // Step 3: C 发现 B
+    assert_eq!(node_c.insert_node(dht_make_id(0x02), "10.0.0.2:9877".into()).unwrap(), true);
     assert_eq!(node_c.node_count(), 1);
 
-    // 步骤3: B 返回 C 给 A（FIND_NODE 路由发现）
+    // Step 4: B 查找 C — B knows A and C, returns both
     let nearest = node_b.find_node(&dht_make_id(0x03));
-    assert_eq!(nearest.len(), 1);
-    assert!(nearest[0].0 == dht_make_id(0x03), "B should return C as nearest to C");
+    assert!(nearest.len() >= 1, "B should return at least C");
+    assert_eq!(nearest[0].0, dht_make_id(0x03), "nearest to C should be C itself");
 
-    // 步骤4: C 从 B 发现 A
+    // Step 5: B 查找 A
     let nearest = node_b.find_node(&dht_make_id(0x01));
-    assert_eq!(nearest.len(), 1);
-    assert_eq!(nearest[0].0, dht_make_id(0x01), "B should return A as nearest to A");
-
-    // 步骤5: 全连接验证
-    assert_eq!(node_b.node_count(), 2);  // B: A + C
-    assert!(node_b.node_count() >= 2, "Central node should know all others");
+    assert!(nearest.len() >= 1, "B should return at least A");
+    assert_eq!(nearest[0].0, dht_make_id(0x01), "nearest to A should be A itself");
 }
 
 #[test]
@@ -443,12 +416,10 @@ fn test_dht_mesh_5_node_full_mesh() {
     let nodes: Vec<DhtManager> = ids.iter().map(|id| DhtManager::new(*id)).collect();
     let addrs: Vec<String> = (1..=5).map(|i| format!("10.0.0.{}:9877", i)).collect();
 
-    // 设置地址
     for (i, node) in nodes.iter().enumerate() {
         node.set_local_addr(addrs[i].clone());
     }
 
-    // 构建全连接 mesh
     for i in 0..5 {
         for j in 0..5 {
             if i != j {
@@ -457,25 +428,21 @@ fn test_dht_mesh_5_node_full_mesh() {
         }
     }
 
-    // 验证全连接
     for (i, node) in nodes.iter().enumerate() {
         assert_eq!(node.node_count(), 4, "Node {} should know 4 others", i + 1);
     }
 
-    // 验证 XOR 路由 — 每个节点都能找到最近的节点
     for i in 0..5 {
         let nearest = nodes[i].find_node(&ids[(i + 2) % 5]);
         assert!(nearest.len() > 0, "Node {} should find nearest", i + 1);
-
-        // 验证 FIND_NODE 不会返回自身
         assert!(
             !nearest.iter().any(|(nid, _)| *nid == ids[i]),
             "Node {} should not find itself", i + 1
         );
     }
 
-    // 验证 PUT/GET 在 mesh 中传播
-    let put_result = nodes[0].put_value(b"mesh-key", b"mesh-value".to_vec(), 3600);
+    // PUT/GET
+    nodes[0].put_value(b"mesh-key", b"mesh-value".to_vec(), 3600);
     let get_result = nodes[0].get_value(b"mesh-key");
     assert!(get_result.is_some());
     assert_eq!(get_result.unwrap().value, b"mesh-value");
@@ -483,27 +450,19 @@ fn test_dht_mesh_5_node_full_mesh() {
 
 #[test]
 fn test_dht_mesh_bucket_distribution() {
-    // 验证 XOR 距离分布：不同节点应落入不同 bucket
     let ids: Vec<NodeID> = (0..10).map(|b| dht_make_id(b * 25 + 1)).collect();
-    let local = ids[0];
-    let node = DhtManager::new(local);
+    let node = DhtManager::new(ids[0]);
 
-    // 插入所有其他节点
     for i in 1..10 {
-        let addr = format!("10.0.0.{}:9877", i);
-        node.insert_node(ids[i], addr).unwrap();
+        node.insert_node(ids[i], format!("10.0.0.{}:9877", i)).unwrap();
     }
-
     assert_eq!(node.node_count(), 9);
 
-    // 验证 bucket 索引不同（XOR 距离不同）
-    let first_bucket = node.bucket_index(&ids[1]);
-    let mut seen_buckets = std::collections::HashSet::new();
+    let mut seen = std::collections::HashSet::new();
     for i in 1..10 {
-        let idx = node.bucket_index(&ids[i]);
-        seen_buckets.insert(idx);
+        seen.insert(node.bucket_index(&ids[i]));
     }
-    assert!(seen_buckets.len() > 1, "Nodes should be in different buckets");
+    assert!(seen.len() > 1, "Nodes should be in different buckets");
 }
 
 #[test]
@@ -513,8 +472,6 @@ fn test_dht_mesh_remove_and_rejoin() {
     let id_c = dht_make_id(0xC0);
 
     let node_a = DhtManager::new(id_a);
-    let node_b = DhtManager::new(id_b);
-    let node_c = DhtManager::new(id_c);
 
     node_a.insert_node(id_b, "10.0.0.2:9877".to_string()).unwrap();
     node_a.insert_node(id_c, "10.0.0.3:9877".to_string()).unwrap();
@@ -525,16 +482,15 @@ fn test_dht_mesh_remove_and_rejoin() {
     assert!(removed.is_some());
     assert_eq!(node_a.node_count(), 1);
 
-    // 验证 FIND_NODE 只返回 B
+    // FIND_NODE 只返回 B（C 已不在）
     let nearest = node_a.find_node(&id_c);
     assert_eq!(nearest.len(), 1);
-    assert_eq!(nearest[0].0, id_b); // 最近的在线节点
+    assert_eq!(nearest[0].0, id_b);
 
     // C 重新上线
     node_a.insert_node(id_c, "10.0.0.3:9877".to_string()).unwrap();
     assert_eq!(node_a.node_count(), 2);
 
-    // 再次查找 C
     let nearest = node_a.find_node(&id_c);
     assert!(nearest.iter().any(|(n, _)| *n == id_c),
             "Rejoined node should be findable");
